@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>$GODOT_PROJECT_NAME</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #111; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; touch-action: none; }
+        #canvas { display: block; width: 100%; height: 100%; position: absolute; top: 0; left: 0; outline: none; }
+        #loading-overlay { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; background: #151515; z-index: 99; transition: opacity 0.3s; }
+        .spinner { width: 50px; height: 50px; border: 4px solid rgba(255,255,255,0.1); border-radius: 50%; border-top-color: #5181b8; animation: spin 0.8s ease-in-out infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #progress-bar-container { width: 200px; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; margin-top: 20px; overflow: hidden; }
+        #progress-bar { width: 0%; height: 100%; background: #5181b8; transition: width 0.1s linear; }
+    </style>
+
+    <script src="https://unpkg.com/@vkontakte/vk-bridge@2.15.0/dist/browser.min.js"></script>
+
+    <script>
+    (function () {
+        'use strict';
+        if (window.GodotVKBridge) return;
+
+        var DEBUG_BRIDGE = false;
+        function log()    { if (DEBUG_BRIDGE) console.log.apply(console, ['[GodotVKBridge]'].concat([].slice.call(arguments))); }
+        function warn()   { console.warn.apply(console, ['[GodotVKBridge]'].concat([].slice.call(arguments))); }
+        function errlog() { console.error.apply(console, ['[GodotVKBridge]'].concat([].slice.call(arguments))); }
+
+        var SEND_TIMEOUT_MS = 4000;
+        var STORAGE_WRITE_FAILURE_THRESHOLD = 5;
+        var STORAGE_WRITE_COOLDOWN_MS = 3600000;
+        var VK_STORAGE_MAX_LEN = 4096;
+
+        var LS_PREFIX = 'unisdk_vk_';
+        function lsKey(k) { return LS_PREFIX + k; }
+        function lsGet(k) { try { var v = localStorage.getItem(lsKey(k)); return v === null ? null : JSON.parse(v); } catch (e) { return null; } }
+        function lsSet(k, v) { try { localStorage.setItem(lsKey(k), JSON.stringify(v)); } catch (e) {} }
+        function lsRemove(k) { try { localStorage.removeItem(lsKey(k)); } catch (e) {} }
+
+        function normalizeValue(v) {
+            if (v === null || v === undefined) return null;
+            if (typeof v === 'string') return v;
+            try { return JSON.stringify(v); } catch (e) { return String(v); }
+        }
+
+        function normalizeFromStorage(k) {
+            try {
+                var raw = localStorage.getItem(lsKey(k));
+                if (raw === null) return null;
+                var parsed = JSON.parse(raw);
+                return normalizeValue(parsed);
+            } catch (e) { return null; }
+        }
+
+        var IS_STAGE_ENV = (function () { try { return window.location.hostname.indexOf('stage-') === 0; } catch (e) { return false; } })();
+        var IS_DESKTOP = (function () { try { return window.innerWidth >= 1024; } catch (e) { return false; } })();
+
+        var Bridge = {
+            vkBridge: null, isInitialized: false, initCompleted: false,
+            pauseResumeCallback: null, launchParams: {}, userInfo: {},
+            _eventsSubscribed: false, _adRequestInFlight: false,
+
+            _storageWriteFailures: 0,
+            _storageWriteDisabled: false,
+            _storageWriteTimestamps: [],
+            _sentValues: {},
+
+            _isOK: function () {
+                var lp = this.launchParams || {};
+                var platform = lp.vk_platform || '';
+                return platform.indexOf('_ok') !== -1;
+            },
+
+            _safeSend: function (method, params, timeoutMs, fallbackValue, silentTimeout) {
+                var self = this;
+                if (!self.vkBridge) return Promise.resolve(fallbackValue);
+                if (typeof timeoutMs !== 'number') timeoutMs = SEND_TIMEOUT_MS;
+                if (typeof fallbackValue === 'undefined') fallbackValue = null;
+                return new Promise(function (resolve) {
+                    var settled = false;
+                    var timer = setTimeout(function () {
+                        if (settled) return;
+                        settled = true;
+                        if (!silentTimeout) warn("_safeSend timeout:", method);
+                        resolve(fallbackValue);
+                    }, timeoutMs);
+                    var finishOk = function (data) { if (settled) return; settled = true; clearTimeout(timer); resolve(data); };
+                    var finishErr = function (err) { if (settled) return; settled = true; clearTimeout(timer); if (!silentTimeout) warn("_safeSend error in", method, ":", err); resolve(fallbackValue); };
+                    try {
+                        var p = self.vkBridge.send(method, params || {});
+                        if (p && typeof p.then === 'function') p.then(finishOk, finishErr);
+                        else finishOk(p);
+                    } catch (e) { finishErr(e); }
+                });
+            },
+
+            init: function (optionsJson, callback) {
+                var self = this;
+                if (typeof vkBridge === 'undefined') { warn("vkBridge SDK not loaded."); callback(JSON.stringify({ success: false, error: "vkBridge SDK not loaded" })); return; }
+                if (IS_STAGE_ENV) { warn("Stage/dev environment detected."); }
+                self.vkBridge = vkBridge;
+                self._safeSend('VKWebAppInit', {}, 10000, null, true).then(function () {
+                    self.initCompleted = true;
+                    self._finishInit(callback);
+                });
+            },
+
+            _finishInit: function (callback) {
+                var self = this;
+                self._safeSend('VKWebAppGetLaunchParams', {}, 3000, {}, true).then(function (lp) {
+                    self.launchParams = lp || {};
+                });
+                self._safeSend('VKWebAppGetUserInfo', {}, 3000, {}, true).then(function (u) {
+                    self.userInfo = u || {};
+                    if (u && u.id) lsSet('__userinfo', u);
+                });
+                self._subscribeEvents();
+                self.isInitialized = true;
+                callback(JSON.stringify({ success: true, data: { environment: self.getEnvironment(), device: self.getDeviceInfo() } }));
+            },
+
+            _subscribeEvents: function () {
+                if (this._eventsSubscribed || !this.vkBridge || !this.vkBridge.subscribe) return;
+                this._eventsSubscribed = true;
+                var self = this;
+                this.vkBridge.subscribe(function (e) {
+                    if (!e || !e.detail) return;
+                    var type = e.detail.type;
+                    if (type === 'VKWebAppViewHide') { if (self.pauseResumeCallback) self.pauseResumeCallback(JSON.stringify({ event: 'pause' })); }
+                    else if (type === 'VKWebAppViewRestore') { self.refocusCanvas(); if (self.pauseResumeCallback) self.pauseResumeCallback(JSON.stringify({ event: 'resume' })); }
+                    else if (type === 'VKWebAppChangeFragment') { if (self.pauseResumeCallback) self.pauseResumeCallback(JSON.stringify({ event: 'history_back' })); }
+                });
+            },
+
+            setPauseResumeCallback: function (cb) { this.pauseResumeCallback = cb; },
+            loadingReady: function () {}, gameplayStart: function () {}, gameplayStop: function () {},
+            serverTime: function () { return Date.now(); },
+            isAvailableMethod: function (methodName, callback) { callback(JSON.stringify({ success: true, available: true })); },
+
+            getEnvironment: function () {
+                var lp = this.launchParams || {};
+                return {
+                    app: { id: String(lp.vk_app_id || '') },
+                    browser: { lang: lp.vk_language || navigator.language || 'ru' },
+                    i18n: { lang: lp.vk_language || 'ru', tld: 'ru' },
+                    payload: lp.vk_ref || '',
+                    fullscreen: false,
+                    referrer: null,
+                    is_ok: this._isOK()
+                };
+            },
+
+            getDeviceInfo: function () {
+                var lp = this.launchParams || {};
+                var platform = lp.vk_platform || 'web';
+                return {
+                    type: platform === 'mobile_web' || platform === 'mobile_web_ok' ? 'mobile' : (platform === 'mobile_ipad' || platform === 'mobile_iphone_ok' ? 'tablet' : 'desktop'),
+                    isMobile: platform === 'mobile_web' || platform === 'mobile_web_ok' || platform === 'mobile_android_ok',
+                    isTablet: platform === 'mobile_ipad' || platform === 'mobile_iphone_ok',
+                    isDesktop: platform === 'web' || platform === 'desktop_web' || platform === 'desktop_web_ok',
+                    isTV: false
+                };
+            },
+
+            fullscreenStatus: function () { return false; },
+            fullscreenRequest: function (callback) { if (callback) callback(JSON.stringify({ success: false, error: 'Not supported on VK' })); },
+            fullscreenExit: function (callback) { if (callback) callback(JSON.stringify({ success: false, error: 'Not supported on VK' })); },
+            screenOrientationGet: function () { return window.innerWidth > window.innerHeight ? 'landscape' : 'portrait'; },
+            screenOrientationSet: function (value, callback) { if (callback) callback(JSON.stringify({ success: false, error: 'Not supported' })); },
+            refocusCanvas: function () { try { window.focus(); var canvas = document.getElementById('canvas') || document.querySelector('canvas'); if (canvas && typeof canvas.focus === 'function') canvas.focus(); } catch (e) {} },
+
+            showNativeAds: function (format, callback) {
+                var self = this;
+                if (!self.vkBridge) { callback(JSON.stringify({ event: 'error', error: 'SDK not initialized' })); return; }
+                if (!self.initCompleted) { callback(JSON.stringify({ event: 'error', error: 'SDK not ready' })); return; }
+                if (self._adRequestInFlight) { callback(JSON.stringify({ event: 'error', error: 'Ad in progress' })); return; }
+
+                var isReward = (format === 'reward');
+                var adFormat = isReward ? 'reward' : 'interstitial';
+
+                // На десктопе VK-реклама не поддерживается.
+                if (IS_DESKTOP) {
+                    callback(JSON.stringify({ event: 'error', error: 'Ads not supported on desktop' }));
+                    return;
+                }
+
+                var checkTimeoutMs = isReward ? 4000 : 1500;
+                var showTimeoutMs = isReward ? 30000 : 10000;
+
+                self._adRequestInFlight = true;
+                var safeCallback = function (payload) { self._adRequestInFlight = false; try { callback(payload); } catch (e) { errlog("callback threw:", e); } };
+                var skipNow = function (reason) { safeCallback(JSON.stringify({ event: 'error', error: reason })); };
+
+                // Последовательный вызов: check -> show.
+                self._safeSend('VKWebAppCheckNativeAds', { ad_format: adFormat }, checkTimeoutMs, null, true)
+                    .then(function (checkResult) {
+                        // null значит таймаут — не показываем рекламу.
+                        if (checkResult === null) { skipNow('Ads check timeout'); return; }
+                        var available = true;
+                        if (typeof checkResult.result === 'boolean') { available = checkResult.result; }
+                        if (!available) { skipNow('No ads available'); return; }
+
+                        var params = { ad_format: adFormat };
+                        if (isReward) params.use_waterfall = true;
+
+                        self._safeSend('VKWebAppShowNativeAds', params, showTimeoutMs, null, true)
+                            .then(function (data) {
+                                if (data === null || data === undefined) { skipNow('Show timeout or error'); return; }
+                                var shown = !!(data && data.result);
+                                if (!shown) { skipNow('Show returned result=false'); return; }
+                                if (isReward) { safeCallback(JSON.stringify({ event: 'rewarded' })); }
+                                safeCallback(JSON.stringify({ event: 'close', wasShown: true, rewarded: isReward }));
+                            });
+                    });
+            },
+
+            showFullscreenAdv: function (callback) { this.showNativeAds('interstitial', callback); },
+            showRewardedVideo: function (callback) { this.showNativeAds('reward', callback); },
+
+            showBannerAd: function (callback) {
+                this._safeSend('VKWebAppShowBannerAd', { banner_location: 'bottom' }, 5000, { result: false }, true)
+                    .then(function (res) { callback(JSON.stringify({ success: true, stickyAdvIsShowing: !!(res && res.result), reason: null })); });
+            },
+            hideBannerAd: function (callback) {
+                this._safeSend('VKWebAppHideBannerAd', {}, 5000, null, true)
+                    .then(function () { callback(JSON.stringify({ success: true, stickyAdvIsShowing: false })); });
+            },
+            getBannerAdStatus: function (callback) { callback(JSON.stringify({ success: true, stickyAdvIsShowing: false, reason: null })); },
+
+            getUserInfo: function (callback) {
+                var self = this;
+                var cached = lsGet('__userinfo');
+
+                // Всегда сначала запрашиваем актуальные данные с VK, параллельно
+                // возвращаем кэш, если он есть и совпадает с реальным id.
+                var request = self._safeSend('VKWebAppGetUserInfo', { use_local: self._isOK() }, 5000, null, true);
+
+                if (cached && cached.id) {
+                    // Мгновенный ответ из кэша.
+                    self.userInfo = cached;
+                    callback(JSON.stringify({ success: true, data: {
+                        isAuthorized: true,
+                        uniqueId: String(cached.id || ''),
+                        name: ((cached.first_name || '') + ' ' + (cached.last_name || '')).trim(),
+                        photoSmall: cached.photo_100 || '',
+                        photoMedium: cached.photo_200 || '',
+                        photoLarge: cached.photo_200_orig || cached.photo_200 || '',
+                        payingStatus: '', signature: ''
+                    }}));
+                    // Фоновая синхронизация с проверкой смены пользователя.
+                    request.then(function (fresh) {
+                        if (!fresh || !fresh.id) return;
+                        if (fresh.id !== cached.id) {
+                            // Пользователь сменился — чистим локальный кэш игрока.
+                            try {
+                                var keysToDel = [];
+                                for (var i = 0; i < localStorage.length; i++) {
+                                    var k = localStorage.key(i);
+                                    if (k && k.indexOf(LS_PREFIX + 'player_') === 0) keysToDel.push(k);
+                                }
+                                for (var j = 0; j < keysToDel.length; j++) localStorage.removeItem(keysToDel[j]);
+                            } catch (e) {}
+                            self._sentValues = {};
+                        }
+                        self.userInfo = fresh;
+                        lsSet('__userinfo', fresh);
+                    });
+                    return;
+                }
+
+                request.then(function (user) {
+                    user = user || {};
+                    self.userInfo = user;
+                    if (user.id) lsSet('__userinfo', user);
+                    callback(JSON.stringify({ success: true, data: {
+                        isAuthorized: !!user.id,
+                        uniqueId: String(user.id || ''),
+                        name: ((user.first_name || '') + ' ' + (user.last_name || '')).trim(),
+                        photoSmall: user.photo_100 || '',
+                        photoMedium: user.photo_200 || '',
+                        photoLarge: user.photo_200_orig || user.photo_200 || '',
+                        payingStatus: '', signature: ''
+                    }}));
+                });
+            },
+
+            initPlayer: function (optionsJson, callback) { this.getUserInfo(callback); },
+            openAuthDialog: function (callback) { this.getUserInfo(callback); },
+
+            storageGet: function (keysJson, callback) {
+                var self = this;
+                var keys = keysJson ? JSON.parse(keysJson) : [];
+                var keysArr = Array.isArray(keys) ? keys : [keys];
+
+                if (keysArr.length === 0) {
+                    callback(JSON.stringify({ success: true, data: {} }));
+                    return;
+                }
+
+                var localResult = {};
+                var hasLocalData = false;
+                for (var i = 0; i < keysArr.length; i++) {
+                    var kv = lsGet(keysArr[i]);
+                    if (kv !== null) { localResult[keysArr[i]] = kv; hasLocalData = true; }
+                }
+
+                var settled = false;
+                self._safeSend('VKWebAppStorageGet', { keys: keysArr }, 10000, null, true)
+                    .then(function (res) {
+                        if (res === null) {
+                            if (!settled) { settled = true; callback(JSON.stringify({ success: true, data: localResult })); }
+                            return;
+                        }
+                        var vkResult = {};
+                        if (res && res.keys) {
+                            for (var j = 0; j < res.keys.length; j++) {
+                                var item = res.keys[j];
+                                var v = item.value;
+                                if (v === '' || v === null || v === undefined) {
+                                    vkResult[item.key] = null;
+                                    delete self._sentValues[item.key];
+                                    continue;
+                                }
+                                try { vkResult[item.key] = JSON.parse(v); }
+                                catch (e) { vkResult[item.key] = v; }
+                                self._sentValues[item.key] = String(v);
+                            }
+                        }
+                        for (var k in vkResult) {
+                            if (Object.prototype.hasOwnProperty.call(vkResult, k)) {
+                                if (vkResult[k] !== null) lsSet(k, vkResult[k]);
+                                else lsRemove(k);
+                            }
+                        }
+                        if (!settled) { settled = true; callback(JSON.stringify({ success: true, data: vkResult })); }
+                    });
+
+                setTimeout(function () {
+                    if (settled) return;
+                    if (hasLocalData) { settled = true; callback(JSON.stringify({ success: true, data: localResult, from_cache: true })); }
+                }, 800);
+            },
+
+            storageSet: function (dataJson, callback) {
+                var self = this;
+                var data = JSON.parse(dataJson);
+
+                // Пишем в localStorage всегда.
+                for (var k in data) { if (Object.prototype.hasOwnProperty.call(data, k)) lsSet(k, data[k]); }
+
+                // Собираем только изменившиеся ключи (единый формат — normalizeValue).
+                var changedKeys = [];
+                for (var k2 in data) {
+                    if (Object.prototype.hasOwnProperty.call(data, k2)) {
+                        var normalised = normalizeValue(data[k2]);
+                        if (self._sentValues[k2] !== normalised) {
+                            // Обрезаем до VK-лимита.
+                            var valueToSend = normalised;
+                            if (valueToSend !== null && valueToSend.length > VK_STORAGE_MAX_LEN) {
+                                warn("VK storage value truncated to " + VK_STORAGE_MAX_LEN + " chars for key " + k2);
+                                valueToSend = valueToSend.substring(0, VK_STORAGE_MAX_LEN);
+                            }
+                            changedKeys.push({ key: k2, value: valueToSend });
+                        }
+                    }
+                }
+
+                callback(JSON.stringify({ success: true, changed: changedKeys.length }));
+
+                if (changedKeys.length === 0) return;
+
+                // Rate limit 1000/час.
+                var now = Date.now();
+                self._storageWriteTimestamps = self._storageWriteTimestamps.filter(function (t) {
+                    return now - t < STORAGE_WRITE_COOLDOWN_MS;
+                });
+                if (self._storageWriteTimestamps.length + changedKeys.length >= 990) {
+                    warn("VK storage rate limit approaching. Skipping.");
+                    return;
+                }
+
+                if (self._storageWriteDisabled) return;
+                if (!self.vkBridge) return;
+
+                // ПОСЛЕДОВАТЕЛЬНАЯ запись (VK Bridge не любит параллельные вызовы).
+                var chain = Promise.resolve();
+                var successCount = 0;
+                var failCount = 0;
+
+                changedKeys.forEach(function (item) {
+                    chain = chain.then(function () {
+                        // Считаем попытку сразу — VK может засчитать вызов даже при ошибке.
+                        self._storageWriteTimestamps.push(Date.now());
+                        return self._safeSend('VKWebAppStorageSet', item, 8000, null, true)
+                            .then(function (res) {
+                                if (res !== null && res !== undefined) {
+                                    self._sentValues[item.key] = item.value;
+                                    successCount++;
+                                } else {
+                                    failCount++;
+                                }
+                            })
+                            .catch(function () { failCount++; });
+                    });
+                });
+
+                chain.then(function () {
+                    if (failCount > 0) {
+                        self._storageWriteFailures += 1;
+                        if (self._storageWriteFailures >= STORAGE_WRITE_FAILURE_THRESHOLD) {
+                            warn("VK cloud storage unavailable — disabling cloud sync.");
+                            self._storageWriteDisabled = true;
+                        }
+                    } else {
+                        self._storageWriteFailures = 0;
+                    }
+                });
+            },
+
+            storageGetItem: function (key, callback) {
+                var wrapped = function (payload) {
+                    var parsed = JSON.parse(payload);
+                    if (parsed.success && parsed.data) {
+                        // Правильная проверка "есть ли ключ".
+                        var hasKey = Object.prototype.hasOwnProperty.call(parsed.data, key);
+                        callback(JSON.stringify({ success: true, value: hasKey ? parsed.data[key] : null }));
+                    } else {
+                        callback(payload);
+                    }
+                };
+                this.storageGet(JSON.stringify([key]), wrapped);
+            },
+
+            storageSetItem: function (key, value, callback) {
+                var obj = {};
+                obj[key] = value;
+                this.storageSet(JSON.stringify(obj), callback);
+            },
+
+            getChanged: function (callback) {
+                var self = this;
+                var changed = [];
+                try {
+                    for (var i = 0; i < localStorage.length; i++) {
+                        var fullKey = localStorage.key(i);
+                        if (!fullKey || fullKey.indexOf(LS_PREFIX) !== 0) continue;
+                        var k = fullKey.substring(LS_PREFIX.length);
+                        if (k === '__userinfo') continue;
+                        var localNormalised = normalizeFromStorage(k);
+                        if (self._sentValues[k] !== localNormalised) { changed.push(k); }
+                    }
+                } catch (e) {}
+                callback(JSON.stringify({ success: true, changed: changed }));
+            },
+
+            openPayForm: function (productId, developerPayload, callback) {
+                if (IS_DESKTOP) {
+                    callback(JSON.stringify({ success: false, error: 'Payments not supported on desktop web' }));
+                    return;
+                }
+                this._safeSend('VKWebAppShowOrderBox', { type: 'item', item: productId }, 120000, undefined, true)
+                    .then(function (res) {
+                        // VK возвращает ошибку в формате {error_type, error_data}.
+                        if (res === undefined || res === null) {
+                            callback(JSON.stringify({ success: false, error: 'Payment timeout or cancelled' }));
+                            return;
+                        }
+                        if (res.error_type || res.error_data) {
+                            var reason = (res.error_data && res.error_data.error_reason) || res.error_type || 'Payment failed';
+                            callback(JSON.stringify({ success: false, error: reason }));
+                            return;
+                        }
+                        callback(JSON.stringify({ success: true, data: {
+                            productID: productId,
+                            purchaseToken: 'vk_token_' + Date.now(),
+                            developerPayload: developerPayload || '',
+                            signature: ''
+                        }}));
+                    });
+            },
+
+            initPayments: function (optionsJson, callback) { callback(JSON.stringify({ success: true })); },
+            purchase: function (optionsJson, callback) { var options = JSON.parse(optionsJson); this.openPayForm(options.id, options.developerPayload || '', callback); },
+            getPurchases: function (callback) { callback(JSON.stringify({ success: true, data: [] })); },
+            getCatalog: function (callback) { callback(JSON.stringify({ success: true, data: [] })); },
+            consumePurchase: function (token, callback) { callback(JSON.stringify({ success: true })); },
+
+            canShowShortcutPrompt: function (callback) {
+                if (this._isOK()) { callback(JSON.stringify({ success: true, data: { canShow: false } })); return; }
+                var lp = this.launchParams || {};
+                var platform = lp.vk_platform || '';
+                var canShow = (platform === 'mobile_web' || platform === 'mobile_ipad');
+                callback(JSON.stringify({ success: true, data: { canShow: canShow } }));
+            },
+            showShortcutPrompt: function (callback) {
+                var lp = this.launchParams || {};
+                var platform = lp.vk_platform || '';
+                if (platform !== 'mobile_web' && platform !== 'mobile_ipad') {
+                    callback(JSON.stringify({ success: false, error: 'Shortcut not supported on this platform' }));
+                    return;
+                }
+                this._safeSend('VKWebAppAddToHomeScreenInfo', {}, 5000, null, true)
+                    .then(function () { callback(JSON.stringify({ success: true, data: { outcome: 'accepted' } })); });
+            },
+
+            dispatchEvent: function (eventName, detailJson, callback) { callback(JSON.stringify({ success: false, error: 'Not supported on VK' })); },
+            dispatchExit: function (callback) { this._safeSend('VKWebAppClose', { status: 'success' }, 2000, null, true).then(function () { if (callback) callback(JSON.stringify({ success: true })); }); }
+        };
+
+        window.GodotVKBridge = Bridge;
+    })();
+    </script>
+</head>
+<body>
+    <canvas id="canvas" oncontextmenu="event.preventDefault();" tabindex="0"></canvas>
+    <div id="loading-overlay"><div class="spinner"></div><div id="progress-bar-container"><div id="progress-bar"></div></div></div>
+    <script src="$GODOT_URL"></script>
+    <script>
+        const GODOT_CONFIG = $GODOT_CONFIG;
+        const engine = new Engine(GODOT_CONFIG);
+        (function () {
+            const loadingOverlay = document.getElementById('loading-overlay');
+            const progressBar = document.getElementById('progress-bar');
+            const canvas = document.getElementById('canvas');
+            window.addEventListener('pointerdown', () => { if (canvas) canvas.focus(); });
+            engine.startGame({ onProgress: function (current, total) { if (total > 0) progressBar.style.width = ((current / total) * 100) + '%'; } })
+                .then(() => { loadingOverlay.style.opacity = '0'; setTimeout(() => { loadingOverlay.remove(); if (canvas) canvas.focus(); }, 300); })
+                .catch(err => console.error("Failed to start Godot:", err));
+        })();
+    </script>
+</body>
+</html>
