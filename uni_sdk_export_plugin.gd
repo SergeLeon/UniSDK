@@ -4,6 +4,15 @@ extends EditorExportPlugin
 
 const VK_DEPLOY_NPM_PACKAGE: String = "@vkontakte/vk-miniapps-deploy"
 
+## Паттерны проверки версий браузеров, которые в Emscripten-выводе
+## срабатывают ложно на Android WebView (в частности, внутри VK).
+## Мы заменяем условие на `false`, чтобы throw никогда не выполнялся.
+const EMSCRIPTEN_BROWSER_CHECK_PATTERNS: Array[String] = [
+	"currentSafariVersion<150200",
+	"currentFirefoxVersion<100",
+	"currentChromeVersion<95",
+]
+
 func _get_name() -> String:
 	return "UniSDK"
 
@@ -194,6 +203,22 @@ static func _export_single_platform(p: UniPlatformProfile, godot_path: String, p
 	if not FileAccess.file_exists(index_path):
 		return { "success": false, "error": "index.html not created at %s" % index_path }
 
+	# ------------------------------------------------------------------
+	#  Патч Emscripten-вывода: убираем ложные проверки версий браузеров,
+	#  из-за которых игра не запускается в WebView VK на Android.
+	# ------------------------------------------------------------------
+	var js_path := abs_dir.path_join("index.js")
+	var patch_res := _patch_emscripten_browser_checks(js_path)
+	if patch_res.get("success", false):
+		if patch_res.get("patched", false):
+			print("[UniSDK] Patched Emscripten browser checks in %s" % js_path)
+		else:
+			print("[UniSDK] No Emscripten browser checks found in %s (skipped)" % js_path)
+	else:
+		printerr("[UniSDK] Failed to patch %s: %s" % [js_path, patch_res.get("error", "unknown")])
+
+	# ------------------------------------------------------------------
+
 	if p.create_hosting_config and not p.hosting_config_name.is_empty():
 		var hc_res := _create_hosting_config_file(abs_dir, p)
 		if not hc_res.get("success", false):
@@ -220,6 +245,54 @@ static func _export_single_platform(p: UniPlatformProfile, godot_path: String, p
 		"profile": p
 	}
 
+# ------------------------------------------------------------------
+#  Патч Emscripten-вывода
+# ------------------------------------------------------------------
+
+## Убирает ложные проверки версий браузеров из сгенерированного index.js.
+##
+## Проблема: Emscripten парсит userAgent и по строке "Version/4.0" (которая
+## присутствует в Android WebView, в т.ч. внутри VK) делает вывод, что это
+## Safari 4.0, и выбрасывает исключение, блокирующее запуск игры.
+##
+## Решение: заменяем условие `<VER < REQUIRED>` на `false`, чтобы throw
+## никогда не срабатывал. Работает и для Safari, и для Firefox, и для Chrome.
+##
+## Возвращает: { success: bool, patched: bool, error: String }
+static func _patch_emscripten_browser_checks(index_js_path: String) -> Dictionary:
+	if not FileAccess.file_exists(index_js_path):
+		return { "success": false, "patched": false, "error": "index.js not found: %s" % index_js_path }
+
+	var file := FileAccess.open(index_js_path, FileAccess.READ)
+	if file == null:
+		return { "success": false, "patched": false, "error": "Cannot open %s" % index_js_path }
+	var content := file.get_as_text()
+	file.close()
+
+	var original := content
+	var replaced_count := 0
+
+	for pattern in EMSCRIPTEN_BROWSER_CHECK_PATTERNS:
+		var before := content
+		content = content.replace(pattern, "false")
+		if content != before:
+			replaced_count += 1
+
+	if replaced_count == 0:
+		return { "success": true, "patched": false, "error": "" }
+
+	var out := FileAccess.open(index_js_path, FileAccess.WRITE)
+	if out == null:
+		return { "success": false, "patched": false, "error": "Cannot write %s" % index_js_path }
+	out.store_string(content)
+	out.close()
+
+	return { "success": true, "patched": true, "error": "" }
+
+# ------------------------------------------------------------------
+#  Hosting config
+# ------------------------------------------------------------------
+
 static func _create_hosting_config_file(abs_dir: String, p: UniPlatformProfile) -> Dictionary:
 	var path := abs_dir.path_join(p.hosting_config_name)
 	if FileAccess.file_exists(path):
@@ -241,6 +314,10 @@ static func _create_hosting_config_file(abs_dir: String, p: UniPlatformProfile) 
 		"message": "Created %s - fill in credentials." % path,
 		"error": ""
 	}
+
+# ------------------------------------------------------------------
+#  Запуск экспорта через Godot CLI
+# ------------------------------------------------------------------
 
 static func _run_export(godot_path: String, project_path: String, preset_name: String, output_path: String) -> Dictionary:
 	var args: PackedStringArray = PackedStringArray([

@@ -187,6 +187,34 @@ func get_banner_status() -> Dictionary:
 		return await call_js_async("getBannerAdStatus")
 	return _core.mock_bridge.get_banner_adv_status()
 
+
+## Быстрая проверка «есть ли реклама в наличии прямо сейчас».
+## VKWebAppCheckNativeAds отвечает быстро, когда рекламы нет, — за счёт этого
+## неудачный межстраничный показ не тянется весь лимит ожидания.
+func check_ad_available(format: String) -> Dictionary:
+	if not is_web():
+		return { "success": true, "available": true }
+	var res: Dictionary = await call_js_async("checkNativeAds", [format], 6.0)
+	if not res.get("success", false):
+		return { "success": false, "available": false, "error": str(res.get("error", "")) }
+	return { "success": true, "available": bool(res.get("available", false)) }
+
+
+## Диагностика: реально ли текущий клиент VK поддерживает нативную рекламу.
+## bridge.supportsAsync — единственный источник правды, но его ответ НЕ
+## используется для блокировки показа: см. комментарий в vk_template.html.
+func supports_native_ads() -> Dictionary:
+	if not is_web():
+		return { "supported": true, "platform": "mock", "methods": {} }
+	var res: Dictionary = await call_js_async("supportsNativeAds", [], 6.0)
+	if not res.get("success", false):
+		return { "supported": true, "platform": "unknown", "methods": {}, "error": str(res.get("error", "")) }
+	return {
+		"supported": bool(res.get("supported", true)),
+		"platform": str(res.get("platform", "unknown")),
+		"methods": res.get("methods", {}),
+	}
+
 # --- Player ---
 func init_player(options: Dictionary = {}) -> Dictionary:
 	var res: Dictionary
@@ -209,19 +237,70 @@ func get_player_photo(size: String = "medium") -> String:
 		_: return str(_cached_player.get("photoMedium", ""))
 
 func get_player_data(keys: Variant = null) -> Dictionary:
-	var res: Dictionary
+	var res: Dictionary = await get_player_data_ex(keys)
+	return res.get("data", {})
+
+
+## Чтение VK Storage со статусом. Ключевое отличие от get_player_data:
+## при недоступности облака возвращается ok=false, поэтому слой сохранений
+## не принимает сетевой сбой за «прогресса нет».
+## Таймаут с запасом: JS-мост сам делает несколько повторов запроса.
+func get_player_data_ex(keys: Variant = null) -> Dictionary:
+	var result: Dictionary = { "ok": false, "data": {}, "from_cache": false }
 	if is_web():
 		var keys_json: String = JSON.stringify(keys) if keys != null else ""
-		res = await call_js_async("storageGet", [keys_json], 15.0)
-	else:
-		res = _core.mock_bridge.get_player_data(keys)
-	return res.get("data", {}) if res.get("success", false) else {}
+		var res: Dictionary = await call_js_async("storageGet", [keys_json], 20.0)
+		if not res.get("success", false):
+			UniLogger.warn(TAG, "storageGet failed: %s" % res.get("error", "unknown"))
+			return result
+		var data = res.get("data", {})
+		result["ok"] = bool(res.get("cloud_ok", false))
+		result["from_cache"] = bool(res.get("from_cache", false))
+		result["data"] = data if data is Dictionary else {}
+		return result
+
+	var mock_res: Dictionary = _core.mock_bridge.get_player_data(keys)
+	result["ok"] = bool(mock_res.get("success", false))
+	result["data"] = mock_res.get("data", {})
+	return result
 
 func set_player_data(data: Dictionary, flush: bool = false) -> bool:
+	var res: Dictionary = await set_player_data_ex(data, flush)
+	return bool(res.get("ok", false))
+
+
+func set_player_data_ex(data: Dictionary, flush: bool = false) -> Dictionary:
 	if is_web():
-		var res: Dictionary = await call_js_async("storageSet", [JSON.stringify(data)], 10.0)
-		return res.get("success", false)
-	return _core.mock_bridge.set_player_data(data, flush).get("success", false)
+		# Таймаут с запасом: JS отвечает после реальной записи в VK Storage.
+		var res: Dictionary = await call_js_async("storageSet", [JSON.stringify(data)], 25.0)
+		var success: bool = bool(res.get("success", false))
+		var cloud_ok: bool = bool(res.get("cloud_ok", false))
+		if not cloud_ok:
+			UniLogger.warn(TAG, "VK cloud write deferred/failed (local mirror kept)")
+		return {
+			"ok": success and cloud_ok,
+			"success": success,
+			"cloud_ok": cloud_ok,
+			"failed": int(res.get("failed", 0)),
+			"deferred": bool(res.get("deferred", false)),
+		}
+
+	var mock_res: Dictionary = _core.mock_bridge.set_player_data(data, flush)
+	return { "ok": bool(mock_res.get("success", false)), "success": bool(mock_res.get("success", false)), "cloud_ok": true }
+
+
+## Синхронная отправка в мост: JS сначала пишет localStorage, затем
+## вызывает VKWebAppStorageSet. Успевает уйти до засыпания WebView.
+func set_player_data_now(data: Dictionary) -> void:
+	if not is_web():
+		_core.mock_bridge.set_player_data(data, true)
+		return
+	var bridge: JavaScriptObject = JavaScriptBridge.get_interface(get_bridge_name())
+	if bridge == null:
+		return
+	var cb: JavaScriptObject = JavaScriptBridge.create_callback(func(_args: Array) -> void: pass)
+	_core._active_js_callbacks.append(cb)
+	bridge.storageSet(JSON.stringify(data), cb)
 
 func get_changed_keys() -> Array:
 	if not is_web():

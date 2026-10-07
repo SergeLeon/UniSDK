@@ -27,6 +27,9 @@
         function warn()   { console.warn.apply(console, ['[GodotYandexBridge]'].concat([].slice.call(arguments))); }
         function errlog() { console.error.apply(console, ['[GodotYandexBridge]'].concat([].slice.call(arguments))); }
 
+        // Сколько ждём облако Яндекс.Игр, прежде чем отдать локальный кэш.
+        var PLAYER_DATA_CLOUD_TIMEOUT_MS = 8000;
+
         var LS_PREFIX = 'unisdk_yandex_';
         function lsKey(k) { return LS_PREFIX + k; }
         function lsGet(k) { try { var v = localStorage.getItem(lsKey(k)); return v === null ? null : JSON.parse(v); } catch (e) { return null; } }
@@ -251,9 +254,26 @@
                     }
                 }
 
+                // Облако SDK — источник истины для синхронизации между
+                // устройствами. Локальный кэш отдаём только при недоступности
+                // облака, иначе старое устройство затирало бы свежий прогресс.
                 var settled = false;
+                var timer = setTimeout(function () {
+                    if (settled) return;
+                    settled = true;
+                    callback(JSON.stringify({
+                        success: true,
+                        data: localResult,
+                        cloud_ok: false,
+                        from_cache: hasLocalData
+                    }));
+                }, PLAYER_DATA_CLOUD_TIMEOUT_MS);
+
                 Promise.resolve(this.player.getData(keys))
                     .then(function (data) {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
                         var result = data || {};
                         for (var k in result) {
                             if (Object.prototype.hasOwnProperty.call(result, k)) {
@@ -267,23 +287,22 @@
                                 if (!(kk in result)) { delete self._sentValues[kk]; }
                             }
                         }
-                        if (!settled) { settled = true; callback(JSON.stringify({ success: true, data: result })); }
+                        callback(JSON.stringify({ success: true, data: result, cloud_ok: true }));
                     })
                     .catch(function (err) {
-                        if (!settled) { settled = true; callback(JSON.stringify({ success: true, data: localResult })); }
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        warn("player.getData failed: " + (err && err.message ? err.message : err));
+                        callback(JSON.stringify({ success: true, data: localResult, cloud_ok: false, from_cache: hasLocalData }));
                     });
-
-                setTimeout(function () {
-                    if (settled) return;
-                    if (hasLocalData) { settled = true; callback(JSON.stringify({ success: true, data: localResult, from_cache: true })); }
-                }, 800);
             },
 
             setPlayerData(dataJson, flush, callback) {
                 var self = this;
-                if (!this.player) { callback(JSON.stringify({ success: false, error: "Player not initialized" })); return; }
+                if (!this.player) { callback(JSON.stringify({ success: false, error: "Player not initialized", cloud_ok: false })); return; }
                 var data;
-                try { data = JSON.parse(dataJson); } catch (e) { callback(JSON.stringify({ success: false, error: "Invalid JSON" })); return; }
+                try { data = JSON.parse(dataJson); } catch (e) { callback(JSON.stringify({ success: false, error: "Invalid JSON", cloud_ok: false })); return; }
 
                 for (var k in data) { if (Object.prototype.hasOwnProperty.call(data, k)) { lsSet("player_" + k, data[k]); } }
 
@@ -298,7 +317,7 @@
                     }
                 }
 
-                if (changedCount === 0) { callback(JSON.stringify({ success: true, changed: 0 })); return; }
+                if (changedCount === 0) { callback(JSON.stringify({ success: true, changed: 0, cloud_ok: true })); return; }
 
                 Promise.resolve(this.player.setData(changed, !!flush))
                     .then(function () {
@@ -307,10 +326,17 @@
                                 self._sentValues[k3] = normalizeValue(changed[k3]);
                             }
                         }
-                        callback(JSON.stringify({ success: true, changed: changedCount }));
+                        callback(JSON.stringify({ success: true, changed: changedCount, cloud_ok: true }));
                     })
                     .catch(function (err) {
-                        callback(JSON.stringify({ success: false, changed: changedCount, error: err.message || String(err) }));
+                        // Данные уже в localStorage — сообщаем, что до облака не дошло,
+                        // вызывающая сторона повторит запись позже.
+                        callback(JSON.stringify({
+                            success: true,
+                            changed: changedCount,
+                            cloud_ok: false,
+                            error: err && err.message ? err.message : String(err)
+                        }));
                     });
             },
 
@@ -385,6 +411,23 @@
         };
 
         window.GodotYandexBridge = Bridge;
+
+        // --- Флаш прогресса при сворачивании/закрытии ---
+        // Мобильный WebView засыпает вместе с таймерами Godot, поэтому игре
+        // нужно сообщить о скрытии страницы: она успевает записать прогресс.
+        function notifyHidden() {
+            try { if (Bridge.pauseResumeCallback) Bridge.pauseResumeCallback(JSON.stringify({ event: 'pause' })); } catch (e) {}
+        }
+        function notifyVisible() {
+            try { if (Bridge.pauseResumeCallback) Bridge.pauseResumeCallback(JSON.stringify({ event: 'resume' })); } catch (e) {}
+        }
+        try {
+            document.addEventListener('visibilitychange', function () {
+                if (document.hidden) notifyHidden(); else notifyVisible();
+            });
+            window.addEventListener('pagehide', notifyHidden);
+            window.addEventListener('freeze', notifyHidden);
+        } catch (e) {}
     })();
     </script>
 </head>

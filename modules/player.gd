@@ -27,20 +27,47 @@ var _backup_platform: String = ""
 
 var _avatar_cache: Dictionary = {}
 
-# Инициализация
 var _init_done: bool = false
 var _init_in_progress: bool = false
 
-# Троттлинг get_data
 var _last_get_data_ms: int = 0
 var _get_data_min_interval_ms: int = 15000
 var _cached_data: Dictionary = {}
 var _cached_data_valid: bool = false
 
+
 func _init(core: Node) -> void:
 	_core = core
-	_get_data_min_interval_ms = int(float(ProjectSettings.get_setting(
-		"uni_sdk/player/get_data_min_interval_sec", 15.0)) * 1000.0)
+	var min_sec: float = float(ProjectSettings.get_setting(
+		"uni_sdk/player/get_data_min_interval_sec", 15.0))
+	_get_data_min_interval_ms = int(min_sec * 1000.0)
+
+
+# ------------------------------------------------------------------
+#  Platform capabilities
+# ------------------------------------------------------------------
+
+## Платформа поддерживает диалог авторизации?
+## Yandex: да, авторизация опциональна.
+## VK / OK: нет, игрок всегда авторизован неявно.
+## Mock: да.
+func is_auth_dialog_supported() -> bool:
+	if not _core.is_initialized:
+		return true
+	var platform: String = _core.get_platform()
+	if platform == "vk":
+		return false
+	return true
+
+
+func can_open_auth_dialog() -> bool:
+	return is_auth_dialog_supported()
+
+
+## Player data доступна на всех платформах и для всех игроков.
+func is_player_data_supported() -> bool:
+	return true
+
 
 # ------------------------------------------------------------------
 #  Инициализация
@@ -54,6 +81,7 @@ func _ensure_initialized() -> void:
 			await _core.get_tree().process_frame
 		return
 	await init()
+
 
 func init(options: Dictionary = {}) -> Dictionary:
 	if _init_done:
@@ -72,11 +100,19 @@ func init(options: Dictionary = {}) -> Dictionary:
 		authorized.emit(_info)
 	return _info
 
+
 func open_auth_dialog() -> Dictionary:
+	if not is_auth_dialog_supported():
+		return _info
 	_info = await _core.get_adapter().open_auth_dialog()
 	if is_authorized():
 		authorized.emit(_info)
 	return _info
+
+
+# ------------------------------------------------------------------
+#  Профиль
+# ------------------------------------------------------------------
 
 func is_authorized() -> bool:
 	return bool(_info.get("isAuthorized", false))
@@ -96,13 +132,13 @@ func get_avatar_texture(size: String = "medium") -> Texture2D:
 func get_paying_status() -> String: return str(_info.get("payingStatus", ""))
 func get_signature() -> String: return str(_info.get("signature", ""))
 
+
 # ------------------------------------------------------------------
 #  Player data
 # ------------------------------------------------------------------
 
 func get_data(keys: Variant = null) -> Dictionary:
 	var now: int = Time.get_ticks_msec()
-	# Троттлинг: если недавно уже читали, и запрошен полный набор — отдаём кэш.
 	if keys == null and _cached_data_valid and (now - _last_get_data_ms) < _get_data_min_interval_ms:
 		data_loaded.emit(_cached_data)
 		return _cached_data.duplicate(true)
@@ -133,28 +169,85 @@ func get_data(keys: Variant = null) -> Dictionary:
 	data_loaded.emit(from_backup)
 	return from_backup
 
+
 func set_data(data: Dictionary, flush: bool = false) -> bool:
-	if data.is_empty():
-		return true
+	var res: Dictionary = await set_data_ex(data, flush)
+	# Обратная совместимость: метод возвращает «сырой» успех записи.
+	# Неудача именно облачной части видна через set_data_ex()["cloud_ok"].
+	return bool(res.get("success", res.get("ok", false)))
+
+
+## Версия get_data со статусом облака.
+## ok=false означает «облако недоступно», а не «данных нет» — слой сохранений
+## использует это, чтобы не затирать облачный прогресс локальными значениями.
+func get_data_ex(keys: Variant = null) -> Dictionary:
+	var res: Dictionary = await _core.get_adapter().get_player_data_ex(keys)
 
 	if not _core.is_web():
-		var ok_mock: bool = await _core.get_adapter().set_player_data(data, flush)
-		if ok_mock:
+		if res.get("ok", false):
+			data_loaded.emit(res.get("data", {}))
+		return res
+
+	_load_backup()
+
+	if not res.get("ok", false):
+		# Облако недоступно: отдаём локальный бэкап и честный статус.
+		var cached: Dictionary = _filter_backup(keys)
+		data_loaded.emit(cached)
+		return { "ok": false, "data": cached, "from_cache": true }
+
+	var cloud: Dictionary = res.get("data", {})
+	_last_get_data_ms = Time.get_ticks_msec()
+	if not cloud.is_empty():
+		_merge_into_backup(cloud)
+		_save_backup()
+	if keys == null:
+		_cached_data = cloud.duplicate(true)
+		_cached_data_valid = true
+	data_loaded.emit(cloud)
+	return res
+
+
+## Версия set_data со статусом: ok=false означает, что данные сохранены
+## локально, но в облако не ушли и запись нужно повторить.
+func set_data_ex(data: Dictionary, flush: bool = false) -> Dictionary:
+	if data.is_empty():
+		return { "ok": true, "success": true, "cloud_ok": true }
+
+	if not _core.is_web():
+		var res_mock: Dictionary = await _core.get_adapter().set_player_data_ex(data, flush)
+		if not res_mock.has("success"):
+			res_mock["success"] = res_mock.get("ok", false)
+		if res_mock.get("ok", false):
 			_cached_data_valid = false
 			data_saved.emit()
-		return ok_mock
+		return res_mock
 
 	_load_backup()
 	_merge_into_backup(data)
 	_save_backup()
 
-	var ok: bool = await _core.get_adapter().set_player_data(data, flush)
-	if ok:
+	var res: Dictionary = await _core.get_adapter().set_player_data_ex(data, flush)
+	if not res.has("success"):
+		res["success"] = res.get("ok", false)
+	if res.get("ok", false):
 		_cached_data_valid = false
 		data_saved.emit()
-	else:
+	elif not res.get("success", false):
 		UniLogger.warn(TAG, "cloud save failed, data preserved in local backup")
-	return ok
+	return res
+
+
+## Синхронный сброс в платформу. Вызывается при сворачивании/закрытии
+## приложения, когда ждать ответа через await уже нельзя.
+func set_data_now(data: Dictionary) -> void:
+	if data.is_empty():
+		return
+	_core.get_adapter().set_player_data_now(data)
+	_load_backup()
+	_merge_into_backup(data)
+	_save_backup()
+
 
 # ------------------------------------------------------------------
 #  Stats
@@ -178,6 +271,7 @@ func get_ids_per_game() -> Array[Dictionary]:
 				list.append(item)
 		return list
 	return _core.mock_bridge.get_player_ids_per_game()
+
 
 # ------------------------------------------------------------------
 #  Локальный бэкап
@@ -253,6 +347,7 @@ func _filter_backup(keys: Variant) -> Dictionary:
 func clear_backup() -> void:
 	_backup.clear()
 	_save_backup()
+
 
 # ------------------------------------------------------------------
 #  Аватарки

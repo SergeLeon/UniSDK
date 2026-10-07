@@ -15,6 +15,47 @@ func _init(core: Node) -> void:
 	_core = core
 	auto_check_unconsumed = bool(ProjectSettings.get_setting("uni_sdk/payments/auto_check_unconsumed", true))
 
+
+# ------------------------------------------------------------------
+#  Platform capabilities
+# ------------------------------------------------------------------
+
+## Покупки доступны?
+## Yandex: всегда.
+## VK / OK: только в мобильном приложении.
+## Mock: всегда.
+func is_purchase_supported() -> bool:
+	if not _core.is_initialized:
+		return true
+	var platform: String = _core.get_platform()
+	if platform == "mock":
+		return true
+	if platform == "vk":
+		return not _core.device.is_desktop()
+	return true
+
+
+## Каталог товаров доступен?
+## Yandex: да.
+## VK / OK: API каталога отсутствует.
+func is_catalog_supported() -> bool:
+	var platform: String = _core.get_platform()
+	if platform == "vk":
+		return false
+	return true
+
+
+func can_purchase() -> bool:
+	return is_purchase_supported()
+
+func can_get_catalog() -> bool:
+	return is_catalog_supported()
+
+
+# ------------------------------------------------------------------
+#  Lifecycle
+# ------------------------------------------------------------------
+
 func init(options: Dictionary = {}) -> bool:
 	var ok: bool = await _core.get_adapter().init_payments(options)
 	if ok and auto_check_unconsumed:
@@ -24,11 +65,17 @@ func init(options: Dictionary = {}) -> bool:
 func init_payments(signed: bool = false) -> bool:
 	return await init({ "signed": signed })
 
+
+# ------------------------------------------------------------------
+#  Purchase
+# ------------------------------------------------------------------
+
 func purchase(product_id: String, developer_payload: String = "") -> Dictionary:
-	if _core.get_platform() == "vk" and _core.device.is_desktop():
-		UniLogger.warn("payments", "purchase not supported on VK desktop")
-		purchase_failed.emit("Not supported on desktop")
-		return {}
+	if not is_purchase_supported():
+		var err := "Purchase not supported on this platform"
+		purchase_failed.emit(err)
+		return { "error": err }
+
 	var purchase_data: Dictionary = await _core.get_adapter().purchase(product_id, developer_payload)
 	if not purchase_data.is_empty():
 		purchase_success.emit(purchase_data)
@@ -36,10 +83,23 @@ func purchase(product_id: String, developer_payload: String = "") -> Dictionary:
 		purchase_failed.emit("Purchase failed")
 	return purchase_data
 
+
+# ------------------------------------------------------------------
+#  Catalog
+# ------------------------------------------------------------------
+
 func get_catalog() -> Array:
+	if not is_catalog_supported():
+		catalog_loaded.emit([])
+		return []
 	var catalog: Array = await _core.get_adapter().get_catalog()
 	catalog_loaded.emit(catalog)
 	return catalog
+
+
+# ------------------------------------------------------------------
+#  Purchases list
+# ------------------------------------------------------------------
 
 func get_purchases() -> Array:
 	var purchases: Array = await _core.get_adapter().get_purchases()
@@ -63,6 +123,11 @@ func consume_all_purchases() -> Array:
 			if await consume_purchase(token):
 				consumed.append(p)
 	return consumed
+
+
+# ------------------------------------------------------------------
+#  Helpers
+# ------------------------------------------------------------------
 
 func get_price_formatted(product: Dictionary) -> String:
 	var price_str: String = str(product.get("price", ""))

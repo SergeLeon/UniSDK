@@ -2,12 +2,27 @@
 <html lang="ru">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>$GODOT_PROJECT_NAME</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
-        html, body { width: 100%; height: 100%; overflow: hidden; background: #111; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; touch-action: none; }
-        #canvas { display: block; width: 100%; height: 100%; position: absolute; top: 0; left: 0; outline: none; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #111;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            touch-action: none;
+        }
+        #canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            outline: none;
+        }
         #loading-overlay { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; background: #151515; z-index: 99; transition: opacity 0.3s; }
         .spinner { width: 50px; height: 50px; border: 4px solid rgba(255,255,255,0.1); border-radius: 50%; border-top-color: #5181b8; animation: spin 0.8s ease-in-out infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -15,7 +30,7 @@
         #progress-bar { width: 0%; height: 100%; background: #5181b8; transition: width 0.1s linear; }
     </style>
 
-    <script src="https://unpkg.com/@vkontakte/vk-bridge@2.15.0/dist/browser.min.js"></script>
+    <script src="https://unpkg.com/@vkontakte/vk-bridge@2.15.1/dist/browser.min.js"></script>
 
     <script>
     (function () {
@@ -30,7 +45,13 @@
         var SEND_TIMEOUT_MS = 4000;
         var STORAGE_WRITE_FAILURE_THRESHOLD = 5;
         var STORAGE_WRITE_COOLDOWN_MS = 3600000;
+        var STORAGE_WRITE_BACKOFF_MS = 60000;
+        var STORAGE_GET_ATTEMPTS = 2;
+        var STORAGE_GET_ATTEMPT_TIMEOUT_MS = 4000;
+        var STORAGE_GET_RETRY_DELAY_MS = 500;
         var VK_STORAGE_MAX_LEN = 4096;
+        // VK разрешает не более 1000 вызовов хранилища в час на пользователя.
+        var VK_STORAGE_HOURLY_LIMIT = 990;
 
         var LS_PREFIX = 'unisdk_vk_';
         function lsKey(k) { return LS_PREFIX + k; }
@@ -54,15 +75,30 @@
         }
 
         var IS_STAGE_ENV = (function () { try { return window.location.hostname.indexOf('stage-') === 0; } catch (e) { return false; } })();
-        var IS_DESKTOP = (function () { try { return window.innerWidth >= 1024; } catch (e) { return false; } })();
+        var IS_DESKTOP = (function () { try { return window.innerWidth >= 1024 && !('ontouchstart' in window); } catch (e) { return false; } })();
+
+        // Ответы VK, означающие "этот формат здесь не поддерживается".
+        // В отличие от "рекламы сейчас нет", это повод выключить формат до конца сессии.
+        var UNSUPPORTED_AD_PATTERNS = [
+            'not supported', 'unsupported', 'not available on this platform',
+            'ads not supported', 'method not found', 'unknown method', 'not implemented'
+        ];
+        var AD_UNSUPPORTED_STREAK_LIMIT = 3;
+
+        function isLandscape() {
+            try { return window.innerWidth > window.innerHeight; } catch (e) { return false; }
+        }
 
         var Bridge = {
             vkBridge: null, isInitialized: false, initCompleted: false,
             pauseResumeCallback: null, launchParams: {}, userInfo: {},
             _eventsSubscribed: false, _adRequestInFlight: false,
+            _bannerShowing: false,
+            _bannerCurrentOrientation: null,
+            _bannerResizeHandler: null,
 
             _storageWriteFailures: 0,
-            _storageWriteDisabled: false,
+            _storageWriteRetryAfterMs: 0,
             _storageWriteTimestamps: [],
             _sentValues: {},
 
@@ -116,6 +152,7 @@
                     if (u && u.id) lsSet('__userinfo', u);
                 });
                 self._subscribeEvents();
+                self._installBannerResizeHandler();
                 self.isInitialized = true;
                 callback(JSON.stringify({ success: true, data: { environment: self.getEnvironment(), device: self.getDeviceInfo() } }));
             },
@@ -166,9 +203,142 @@
             fullscreenStatus: function () { return false; },
             fullscreenRequest: function (callback) { if (callback) callback(JSON.stringify({ success: false, error: 'Not supported on VK' })); },
             fullscreenExit: function (callback) { if (callback) callback(JSON.stringify({ success: false, error: 'Not supported on VK' })); },
-            screenOrientationGet: function () { return window.innerWidth > window.innerHeight ? 'landscape' : 'portrait'; },
+            screenOrientationGet: function () { return isLandscape() ? 'landscape' : 'portrait'; },
             screenOrientationSet: function (value, callback) { if (callback) callback(JSON.stringify({ success: false, error: 'Not supported' })); },
             refocusCanvas: function () { try { window.focus(); var canvas = document.getElementById('canvas') || document.querySelector('canvas'); if (canvas && typeof canvas.focus === 'function') canvas.focus(); } catch (e) {} },
+
+            // ------------------------------------------------------------------
+            //  Advertisement
+            //
+            //  ВАЖНО про десктоп.
+            //  VK Bridge на веб-платформе лишь пересылает метод в родительский
+            //  фрейм (vk.ru / m.vk.ru) — решение о показе принимает бэкенд VK.
+            //  bridge.supports()/supportsAsync() отвечают по статическому списку
+            //  методов в клиентской библиотеке, а он исторически расходился с
+            //  реальной выдачей (см. VKCOM/vk-bridge#287: supports() возвращал
+            //  false, а вызов метода отрабатывал). Поэтому мы НЕ блокируем
+            //  нативную рекламу по платформе: пытаемся вызвать и смотрим ответ.
+            //  Явное "не поддерживается" гасит формат до конца сессии
+            //  (см. Bridge._classifyAdError и UNSUPPORTED_AD_PATTERNS).
+            // ------------------------------------------------------------------
+
+            _adTelemetry: { calls: [], interstitial: null, rewarded: null },
+
+            _adFormatState: function (format) {
+                var key = format === 'reward' ? 'rewarded' : 'interstitial';
+                if (!this._adTelemetry[key]) {
+                    this._adTelemetry[key] = {
+                        attempts: 0, shown: 0, failed: 0, unsupported: 0,
+                        failStreak: 0, disabled: false, lastError: '', lastStatus: ''
+                    };
+                }
+                return this._adTelemetry[key];
+            },
+
+            _recordAdCall: function (entry) {
+                entry.t = Date.now();
+                this._adTelemetry.calls.push(entry);
+                if (this._adTelemetry.calls.length > 50) this._adTelemetry.calls.shift();
+            },
+
+            /** Определяет по ответу VK, отдаёт ли платформа этот формат вообще. */
+            _classifyAdError: function (err) {
+                var text = '';
+                if (err && typeof err === 'object') {
+                    text = String(err.error_msg || err.error_message || err.error_type ||
+                        (err.error_data && err.error_data.error_reason) || err.message || '');
+                } else if (typeof err === 'string') {
+                    text = err;
+                }
+                var lower = text.toLowerCase();
+                for (var i = 0; i < UNSUPPORTED_AD_PATTERNS.length; i++) {
+                    if (lower.indexOf(UNSUPPORTED_AD_PATTERNS[i]) !== -1) {
+                        return { notSupported: true, text: text || 'not supported' };
+                    }
+                }
+                if (!text && err && typeof err === 'object') {
+                    try { text = JSON.stringify(err); } catch (e) { text = 'unknown error'; }
+                }
+                return { notSupported: false, text: text || 'unknown error' };
+            },
+
+            /** Отчёт по рекламе: что запрашивали, что ответил VK, что реально показали. */
+            adReport: function (logToConsole) {
+                var t = this._adTelemetry;
+                var lines = [];
+                lines.push('VK ads: vk_platform=' + ((this.launchParams || {}).vk_platform || 'unknown'));
+                ['interstitial', 'rewarded'].forEach(function (key) {
+                    var s = t[key];
+                    if (!s) { lines.push(key + ': no attempts'); return; }
+                    lines.push(key + ': attempts=' + s.attempts + ' shown=' + s.shown +
+                        ' failed=' + s.failed + ' unsupported=' + s.unsupported +
+                        ' disabled=' + s.disabled + ' last=' + s.lastStatus +
+                        (s.lastError ? ' | ' + s.lastError : ''));
+                });
+                t.calls.forEach(function (c) {
+                    lines.push('  ' + new Date(c.t).toISOString() + ' ' + c.format + ' -> ' + c.status +
+                        (c.error ? ' (' + c.error + ')' : ''));
+                });
+                var report = lines.join('\n');
+                if (logToConsole !== false) console.log('[VK ads report]\n' + report);
+                try { localStorage.setItem(lsKey('__ad_report'), report); } catch (e) {}
+                return report;
+            },
+
+            adGetReport: function (callback) {
+                var report = this.adReport(true);
+                if (callback) callback(JSON.stringify({ success: true, report: report }));
+            },
+
+            /** Диагностика: спрашивает у VK Bridge, какие методы он считает доступными. */
+            supportsNativeAds: function (callback) {
+                var self = this;
+                var result = {
+                    success: true,
+                    platform: (self.launchParams || {}).vk_platform || 'unknown',
+                    supported: true,
+                    methods: { showNativeAds: true, checkNativeAds: true, showBannerAd: true, supportsAsync: false }
+                };
+                if (!self.vkBridge) { callback(JSON.stringify(result)); return; }
+                if (self.vkBridge.supports) {
+                    try {
+                        result.methods.showNativeAds = !!self.vkBridge.supports('VKWebAppShowNativeAds');
+                        result.methods.checkNativeAds = !!self.vkBridge.supports('VKWebAppCheckNativeAds');
+                        result.methods.showBannerAd = !!self.vkBridge.supports('VKWebAppShowBannerAd');
+                    } catch (e) {}
+                }
+                if (typeof self.vkBridge.supportsAsync === 'function') {
+                    result.methods.supportsAsync = true;
+                    // supportsAsync может не ответить (старый клиент) — не ждём дольше 3с.
+                    var settled = false;
+                    var finish = function () { if (!settled) { settled = true; callback(JSON.stringify(result)); } };
+                    setTimeout(finish, 3000);
+                    self.vkBridge.supportsAsync('VKWebAppShowNativeAds').then(function (ok) {
+                        result.supported = !!ok;
+                        result.methods.supportsAsyncShowNativeAds = !!ok;
+                        finish();
+                    }, function () { finish(); });
+                    return;
+                }
+                callback(JSON.stringify(result));
+            },
+
+            /** Быстрая проверка: есть ли реклама в наличии. Ответ VK — { result: bool }. */
+            checkNativeAds: function (format, callback) {
+                var self = this;
+                if (!self.vkBridge) { callback(JSON.stringify({ success: false, available: false, error: 'SDK not initialized' })); return; }
+                if (!self.initCompleted) { callback(JSON.stringify({ success: false, available: false, error: 'SDK not ready' })); return; }
+                var adFormat = (format === 'reward') ? 'reward' : 'interstitial';
+                // Короткий таймаут: проверка нужна именно как быстрый фильтр.
+                self._safeSend('VKWebAppCheckNativeAds', { ad_format: adFormat }, 2000, null, true)
+                    .then(function (data) {
+                        if (data === null || data === undefined) {
+                            callback(JSON.stringify({ success: true, available: false, reason: 'check_timeout' }));
+                            return;
+                        }
+                        callback(JSON.stringify({ success: true, available: !!(data && data.result) }));
+                    });
+            },
 
             showNativeAds: function (format, callback) {
                 var self = this;
@@ -178,66 +348,195 @@
 
                 var isReward = (format === 'reward');
                 var adFormat = isReward ? 'reward' : 'interstitial';
+                var state = self._adFormatState(adFormat);
 
-                // На десктопе VK-реклама не поддерживается.
-                if (IS_DESKTOP) {
-                    callback(JSON.stringify({ event: 'error', error: 'Ads not supported on desktop' }));
+                if (state.disabled) {
+                    callback(JSON.stringify({
+                        event: 'error', error: 'Not supported on this platform',
+                        notSupported: true, reason: 'unsupported'
+                    }));
                     return;
                 }
 
-                var checkTimeoutMs = isReward ? 4000 : 1500;
                 var showTimeoutMs = isReward ? 30000 : 10000;
 
                 self._adRequestInFlight = true;
-                var safeCallback = function (payload) { self._adRequestInFlight = false; try { callback(payload); } catch (e) { errlog("callback threw:", e); } };
-                var skipNow = function (reason) { safeCallback(JSON.stringify({ event: 'error', error: reason })); };
+                var settled = false;
+                // Показ может породить несколько событий ('rewarded' + 'close'),
+                // поэтому защита от повторов гасит только ошибочные ветки,
+                // а сами события показа отдаём все: иначе GDScript-адаптер
+                // не дождётся close и будет ждать его до таймаута.
+                var emit = function (payloads) {
+                    if (settled) return;
+                    settled = true;
+                    self._adRequestInFlight = false;
+                    for (var i = 0; i < payloads.length; i++) {
+                        try { callback(payloads[i]); } catch (e) { errlog("ad callback threw:", e); }
+                    }
+                };
 
-                // Последовательный вызов: check -> show.
-                self._safeSend('VKWebAppCheckNativeAds', { ad_format: adFormat }, checkTimeoutMs, null, true)
-                    .then(function (checkResult) {
-                        // null значит таймаут — не показываем рекламу.
-                        if (checkResult === null) { skipNow('Ads check timeout'); return; }
-                        var available = true;
-                        if (typeof checkResult.result === 'boolean') { available = checkResult.result; }
-                        if (!available) { skipNow('No ads available'); return; }
+                var fail = function (status, errorText, notSupported) {
+                    state.attempts += 1;
+                    state.failed += 1;
+                    if (notSupported) {
+                        state.unsupported += 1;
+                        state.failStreak += 1;
+                        if (state.failStreak >= AD_UNSUPPORTED_STREAK_LIMIT) state.disabled = true;
+                    } else {
+                        state.failStreak = 0;
+                    }
+                    state.lastStatus = status;
+                    state.lastError = errorText;
+                    self._recordAdCall({ format: adFormat, status: status, error: errorText, unsupported: !!notSupported });
+                    emit([JSON.stringify({
+                        event: 'error', error: errorText, notSupported: !!notSupported, reason: status
+                    })]);
+                };
 
-                        var params = { ad_format: adFormat };
-                        if (isReward) params.use_waterfall = true;
+                // Никакого VKWebAppCheckNativeAds перед показом: это лишний
+                // round-trip, который в мобильном вебе может съесть несколько
+                // секунд и не увеличивает fill rate. Сразу пробуем показать.
+                var params = { ad_format: adFormat };
+                if (isReward) params.use_waterfall = true;
 
-                        self._safeSend('VKWebAppShowNativeAds', params, showTimeoutMs, null, true)
-                            .then(function (data) {
-                                if (data === null || data === undefined) { skipNow('Show timeout or error'); return; }
-                                var shown = !!(data && data.result);
-                                if (!shown) { skipNow('Show returned result=false'); return; }
-                                if (isReward) { safeCallback(JSON.stringify({ event: 'rewarded' })); }
-                                safeCallback(JSON.stringify({ event: 'close', wasShown: true, rewarded: isReward }));
-                            });
+                self._safeSend('VKWebAppShowNativeAds', params, showTimeoutMs, null, true)
+                    .then(function (data) {
+                        if (data === null || data === undefined) {
+                            fail('timeout', 'Show timeout or error', false);
+                            return;
+                        }
+                        if (data.error_type || data.error_msg || data.error_data) {
+                            var classified = self._classifyAdError(data);
+                            fail(classified.notSupported ? 'unsupported' : 'failed',
+                                classified.text, classified.notSupported);
+                            return;
+                        }
+                        var shown = !!data.result;
+                        if (!shown) { fail('not_filled', 'No ads available', false); return; }
+
+                        // Показ состоялся: результат уже известен, отдельного
+                        // события close от VK Bridge для native ads нет.
+                        state.attempts += 1;
+                        state.shown += 1;
+                        state.failStreak = 0;
+                        state.lastStatus = 'shown';
+                        state.lastError = '';
+                        self._recordAdCall({ format: adFormat, status: 'shown', error: '', unsupported: false });
+                        // Отдаём все события показа: 'rewarded' — награда,
+                        // 'close' — конец показа (его ждёт GDScript-адаптер).
+                        var events = [];
+                        if (isReward) {
+                            events.push(JSON.stringify({ event: 'rewarded', rewarded: true, reason: 'shown' }));
+                        }
+                        events.push(JSON.stringify({
+                            event: 'close', wasShown: true, rewarded: isReward, reason: 'shown'
+                        }));
+                        emit(events);
                     });
             },
 
             showFullscreenAdv: function (callback) { this.showNativeAds('interstitial', callback); },
             showRewardedVideo: function (callback) { this.showNativeAds('reward', callback); },
 
+            // ------------------------------------------------------------------
+            //  Banner
+            //
+            //  Позиция баннера зависит от ориентации экрана:
+            //    - Портрет:   снизу по ширине экрана (horizontal)
+            //    - Ландшафт:  справа вертикальный overlay
+            //
+            //  Параметры VK Bridge для этих вариантов:
+            //    - Портрет:   banner_location='bottom', orientation='horizontal'
+            //    - Ландшафт:  layout_type='overlay', banner_align='right',
+            //                 orientation='vertical'
+            // ------------------------------------------------------------------
+
+            _buildBannerParams: function () {
+                var landscape = isLandscape();
+                if (landscape) {
+                    return {
+                        layout_type: 'overlay',
+                        banner_align: 'right',
+                        orientation: 'vertical'
+                    };
+                } else {
+                    return {
+                        banner_location: 'bottom',
+                        orientation: 'horizontal',
+                        height_type: 'regular'
+                    };
+                }
+            },
+
+            _installBannerResizeHandler: function () {
+                var self = this;
+                if (self._bannerResizeHandler) return;
+                self._bannerResizeHandler = function () {
+                    if (!self._bannerShowing) return;
+                    var newOrientation = isLandscape() ? 'landscape' : 'portrait';
+                    if (newOrientation === self._bannerCurrentOrientation) return;
+                    log("Banner: orientation changed to", newOrientation, "- re-showing");
+                    self._bannerCurrentOrientation = newOrientation;
+                    // Скрываем старый и показываем заново с новыми параметрами
+                    self._safeSend('VKWebAppHideBannerAd', {}, 3000, null, true).then(function () {
+                        self._safeSend('VKWebAppShowBannerAd', self._buildBannerParams(), 5000, { result: false }, true);
+                    });
+                };
+                window.addEventListener('resize', self._bannerResizeHandler);
+                window.addEventListener('orientationchange', self._bannerResizeHandler);
+            },
+
             showBannerAd: function (callback) {
-                this._safeSend('VKWebAppShowBannerAd', { banner_location: 'bottom' }, 5000, { result: false }, true)
-                    .then(function (res) { callback(JSON.stringify({ success: true, stickyAdvIsShowing: !!(res && res.result), reason: null })); });
+                var self = this;
+                if (!self.vkBridge) {
+                    if (callback) callback(JSON.stringify({ success: false, error: 'SDK not initialized' }));
+                    return;
+                }
+                var params = self._buildBannerParams();
+                self._bannerCurrentOrientation = isLandscape() ? 'landscape' : 'portrait';
+                log("showBannerAd params:", params);
+
+                self._safeSend('VKWebAppShowBannerAd', params, 5000, { result: false }, true)
+                    .then(function (res) {
+                        var showing = !!(res && res.result);
+                        self._bannerShowing = showing;
+                        if (callback) {
+                            callback(JSON.stringify({
+                                success: true,
+                                stickyAdvIsShowing: showing,
+                                reason: null
+                            }));
+                        }
+                    });
             },
+
             hideBannerAd: function (callback) {
-                this._safeSend('VKWebAppHideBannerAd', {}, 5000, null, true)
-                    .then(function () { callback(JSON.stringify({ success: true, stickyAdvIsShowing: false })); });
+                var self = this;
+                self._bannerShowing = false;
+                self._safeSend('VKWebAppHideBannerAd', {}, 5000, null, true)
+                    .then(function () {
+                        if (callback) callback(JSON.stringify({ success: true, stickyAdvIsShowing: false }));
+                    });
             },
-            getBannerAdStatus: function (callback) { callback(JSON.stringify({ success: true, stickyAdvIsShowing: false, reason: null })); },
+
+            getBannerAdStatus: function (callback) {
+                callback(JSON.stringify({
+                    success: true,
+                    stickyAdvIsShowing: !!this._bannerShowing,
+                    reason: null
+                }));
+            },
+
+            // ------------------------------------------------------------------
+            //  Player
+            // ------------------------------------------------------------------
 
             getUserInfo: function (callback) {
                 var self = this;
                 var cached = lsGet('__userinfo');
-
-                // Всегда сначала запрашиваем актуальные данные с VK, параллельно
-                // возвращаем кэш, если он есть и совпадает с реальным id.
                 var request = self._safeSend('VKWebAppGetUserInfo', { use_local: self._isOK() }, 5000, null, true);
 
                 if (cached && cached.id) {
-                    // Мгновенный ответ из кэша.
                     self.userInfo = cached;
                     callback(JSON.stringify({ success: true, data: {
                         isAuthorized: true,
@@ -248,11 +547,9 @@
                         photoLarge: cached.photo_200_orig || cached.photo_200 || '',
                         payingStatus: '', signature: ''
                     }}));
-                    // Фоновая синхронизация с проверкой смены пользователя.
                     request.then(function (fresh) {
                         if (!fresh || !fresh.id) return;
                         if (fresh.id !== cached.id) {
-                            // Пользователь сменился — чистим локальный кэш игрока.
                             try {
                                 var keysToDel = [];
                                 for (var i = 0; i < localStorage.length; i++) {
@@ -288,13 +585,17 @@
             initPlayer: function (optionsJson, callback) { this.getUserInfo(callback); },
             openAuthDialog: function (callback) { this.getUserInfo(callback); },
 
+            // ------------------------------------------------------------------
+            //  Storage
+            // ------------------------------------------------------------------
+
             storageGet: function (keysJson, callback) {
                 var self = this;
                 var keys = keysJson ? JSON.parse(keysJson) : [];
                 var keysArr = Array.isArray(keys) ? keys : [keys];
 
                 if (keysArr.length === 0) {
-                    callback(JSON.stringify({ success: true, data: {} }));
+                    callback(JSON.stringify({ success: true, data: {}, cloud_ok: true }));
                     return;
                 }
 
@@ -305,57 +606,76 @@
                     if (kv !== null) { localResult[keysArr[i]] = kv; hasLocalData = true; }
                 }
 
-                var settled = false;
-                self._safeSend('VKWebAppStorageGet', { keys: keysArr }, 10000, null, true)
-                    .then(function (res) {
-                        if (res === null) {
-                            if (!settled) { settled = true; callback(JSON.stringify({ success: true, data: localResult })); }
-                            return;
-                        }
-                        var vkResult = {};
-                        if (res && res.keys) {
-                            for (var j = 0; j < res.keys.length; j++) {
-                                var item = res.keys[j];
-                                var v = item.value;
-                                if (v === '' || v === null || v === undefined) {
-                                    vkResult[item.key] = null;
-                                    delete self._sentValues[item.key];
-                                    continue;
+                // VK Storage — общее хранилище пользователя, привязанное к user_id,
+                // а не к устройству и браузеру. Именно оно синхронизирует прогресс
+                // между платформами, поэтому читаем его первым и с повторами.
+                // Локальный кэш отдаём только если облако недоступно, иначе
+                // устройство со старым кэшем затирало бы свежий облачный прогресс.
+                var attempt = 0;
+                var attemptOnce = function () {
+                    attempt++;
+                    return self._safeSend('VKWebAppStorageGet', { keys: keysArr }, STORAGE_GET_ATTEMPT_TIMEOUT_MS, null, true)
+                        .then(function (res) {
+                            if (res === null || typeof res === 'undefined') {
+                                if (attempt < STORAGE_GET_ATTEMPTS) {
+                                    return new Promise(function (resolve) {
+                                        setTimeout(resolve, STORAGE_GET_RETRY_DELAY_MS * attempt);
+                                    }).then(attemptOnce);
                                 }
-                                try { vkResult[item.key] = JSON.parse(v); }
-                                catch (e) { vkResult[item.key] = v; }
-                                self._sentValues[item.key] = String(v);
+                                warn("VKWebAppStorageGet недоступно после " + attempt + " попыток — работаем на локальном кэше");
+                                return { cloud_ok: false };
                             }
-                        }
-                        for (var k in vkResult) {
-                            if (Object.prototype.hasOwnProperty.call(vkResult, k)) {
-                                if (vkResult[k] !== null) lsSet(k, vkResult[k]);
-                                else lsRemove(k);
+                            var vkResult = {};
+                            if (res && res.keys) {
+                                for (var j = 0; j < res.keys.length; j++) {
+                                    var item = res.keys[j];
+                                    var v = item.value;
+                                    if (v === '' || v === null || v === undefined) {
+                                        vkResult[item.key] = null;
+                                        delete self._sentValues[item.key];
+                                        continue;
+                                    }
+                                    try { vkResult[item.key] = JSON.parse(v); }
+                                    catch (e) { vkResult[item.key] = v; }
+                                    self._sentValues[item.key] = String(v);
+                                }
                             }
-                        }
-                        if (!settled) { settled = true; callback(JSON.stringify({ success: true, data: vkResult })); }
-                    });
+                            for (var k in vkResult) {
+                                if (Object.prototype.hasOwnProperty.call(vkResult, k)) {
+                                    if (vkResult[k] !== null) lsSet(k, vkResult[k]);
+                                    else lsRemove(k);
+                                }
+                            }
+                            return { cloud_ok: true, data: vkResult };
+                        }, function () {
+                            return { cloud_ok: false };
+                        });
+                };
 
-                setTimeout(function () {
-                    if (settled) return;
-                    if (hasLocalData) { settled = true; callback(JSON.stringify({ success: true, data: localResult, from_cache: true })); }
-                }, 800);
+                attemptOnce().then(function (outcome) {
+                    if (outcome && outcome.cloud_ok) {
+                        callback(JSON.stringify({ success: true, data: outcome.data, cloud_ok: true }));
+                    } else if (hasLocalData) {
+                        callback(JSON.stringify({ success: true, data: localResult, cloud_ok: false, from_cache: true }));
+                    } else {
+                        callback(JSON.stringify({ success: true, data: {}, cloud_ok: false }));
+                    }
+                });
             },
 
             storageSet: function (dataJson, callback) {
                 var self = this;
                 var data = JSON.parse(dataJson);
 
-                // Пишем в localStorage всегда.
+                // Локальное зеркало пишем синхронно и всегда: если приложение
+                // закроют до ответа облака, прогресс останется на устройстве.
                 for (var k in data) { if (Object.prototype.hasOwnProperty.call(data, k)) lsSet(k, data[k]); }
 
-                // Собираем только изменившиеся ключи (единый формат — normalizeValue).
                 var changedKeys = [];
                 for (var k2 in data) {
                     if (Object.prototype.hasOwnProperty.call(data, k2)) {
                         var normalised = normalizeValue(data[k2]);
                         if (self._sentValues[k2] !== normalised) {
-                            // Обрезаем до VK-лимита.
                             var valueToSend = normalised;
                             if (valueToSend !== null && valueToSend.length > VK_STORAGE_MAX_LEN) {
                                 warn("VK storage value truncated to " + VK_STORAGE_MAX_LEN + " chars for key " + k2);
@@ -366,31 +686,39 @@
                     }
                 }
 
-                callback(JSON.stringify({ success: true, changed: changedKeys.length }));
+                if (changedKeys.length === 0) {
+                    callback(JSON.stringify({ success: true, cloud_ok: true, changed: 0 }));
+                    return;
+                }
 
-                if (changedKeys.length === 0) return;
-
-                // Rate limit 1000/час.
                 var now = Date.now();
                 self._storageWriteTimestamps = self._storageWriteTimestamps.filter(function (t) {
                     return now - t < STORAGE_WRITE_COOLDOWN_MS;
                 });
-                if (self._storageWriteTimestamps.length + changedKeys.length >= 990) {
-                    warn("VK storage rate limit approaching. Skipping.");
+
+                // После серии сетевых сбоев делаем паузу, но НЕ отключаем
+                // облако навсегда: иначе прогресс остаётся только на устройстве.
+                if (now < self._storageWriteRetryAfterMs) {
+                    callback(JSON.stringify({ success: true, cloud_ok: false, changed: changedKeys.length, deferred: true }));
+                    return;
+                }
+                if (self._storageWriteTimestamps.length + changedKeys.length >= VK_STORAGE_HOURLY_LIMIT) {
+                    warn("VK storage: приближение к лимиту запросов. Запись отложена.");
+                    self._storageWriteRetryAfterMs = now + STORAGE_WRITE_BACKOFF_MS;
+                    callback(JSON.stringify({ success: true, cloud_ok: false, changed: changedKeys.length, deferred: true }));
+                    return;
+                }
+                if (!self.vkBridge) {
+                    callback(JSON.stringify({ success: false, error: 'SDK not initialized', cloud_ok: false }));
                     return;
                 }
 
-                if (self._storageWriteDisabled) return;
-                if (!self.vkBridge) return;
-
-                // ПОСЛЕДОВАТЕЛЬНАЯ запись (VK Bridge не любит параллельные вызовы).
                 var chain = Promise.resolve();
                 var successCount = 0;
                 var failCount = 0;
 
                 changedKeys.forEach(function (item) {
                     chain = chain.then(function () {
-                        // Считаем попытку сразу — VK может засчитать вызов даже при ошибке.
                         self._storageWriteTimestamps.push(Date.now());
                         return self._safeSend('VKWebAppStorageSet', item, 8000, null, true)
                             .then(function (res) {
@@ -405,16 +733,24 @@
                     });
                 });
 
+                // Отвечаем только после реальной записи: вызывающая сторона
+                // должна знать, уехал прогресс в облако или нет.
                 chain.then(function () {
                     if (failCount > 0) {
                         self._storageWriteFailures += 1;
                         if (self._storageWriteFailures >= STORAGE_WRITE_FAILURE_THRESHOLD) {
-                            warn("VK cloud storage unavailable — disabling cloud sync.");
-                            self._storageWriteDisabled = true;
+                            warn("VK cloud storage недоступно — повторим позже.");
+                            self._storageWriteRetryAfterMs = Date.now() + STORAGE_WRITE_BACKOFF_MS;
                         }
                     } else {
                         self._storageWriteFailures = 0;
                     }
+                    callback(JSON.stringify({
+                        success: successCount > 0 || failCount === 0,
+                        cloud_ok: failCount === 0,
+                        changed: successCount,
+                        failed: failCount
+                    }));
                 });
             },
 
@@ -422,9 +758,12 @@
                 var wrapped = function (payload) {
                     var parsed = JSON.parse(payload);
                     if (parsed.success && parsed.data) {
-                        // Правильная проверка "есть ли ключ".
                         var hasKey = Object.prototype.hasOwnProperty.call(parsed.data, key);
-                        callback(JSON.stringify({ success: true, value: hasKey ? parsed.data[key] : null }));
+                        callback(JSON.stringify({
+                            success: true,
+                            value: hasKey ? parsed.data[key] : null,
+                            cloud_ok: !!parsed.cloud_ok
+                        }));
                     } else {
                         callback(payload);
                     }
@@ -454,6 +793,10 @@
                 callback(JSON.stringify({ success: true, changed: changed }));
             },
 
+            // ------------------------------------------------------------------
+            //  Payments
+            // ------------------------------------------------------------------
+
             openPayForm: function (productId, developerPayload, callback) {
                 if (IS_DESKTOP) {
                     callback(JSON.stringify({ success: false, error: 'Payments not supported on desktop web' }));
@@ -461,7 +804,6 @@
                 }
                 this._safeSend('VKWebAppShowOrderBox', { type: 'item', item: productId }, 120000, undefined, true)
                     .then(function (res) {
-                        // VK возвращает ошибку в формате {error_type, error_data}.
                         if (res === undefined || res === null) {
                             callback(JSON.stringify({ success: false, error: 'Payment timeout or cancelled' }));
                             return;
@@ -486,6 +828,10 @@
             getCatalog: function (callback) { callback(JSON.stringify({ success: true, data: [] })); },
             consumePurchase: function (token, callback) { callback(JSON.stringify({ success: true })); },
 
+            // ------------------------------------------------------------------
+            //  Shortcut
+            // ------------------------------------------------------------------
+
             canShowShortcutPrompt: function (callback) {
                 if (this._isOK()) { callback(JSON.stringify({ success: true, data: { canShow: false } })); return; }
                 var lp = this.launchParams || {};
@@ -504,11 +850,33 @@
                     .then(function () { callback(JSON.stringify({ success: true, data: { outcome: 'accepted' } })); });
             },
 
+            // ------------------------------------------------------------------
+            //  SDK Events
+            // ------------------------------------------------------------------
+
             dispatchEvent: function (eventName, detailJson, callback) { callback(JSON.stringify({ success: false, error: 'Not supported on VK' })); },
             dispatchExit: function (callback) { this._safeSend('VKWebAppClose', { status: 'success' }, 2000, null, true).then(function () { if (callback) callback(JSON.stringify({ success: true })); }); }
         };
 
         window.GodotVKBridge = Bridge;
+
+        // --- Флаш прогресса при сворачивании/закрытии ---
+        // На мобильных платформах WebView засыпает вместе с таймерами Godot,
+        // поэтому игре нужно сообщить о скрытии страницы: она успевает
+        // отправить накопленный прогресс в VK Storage.
+        function notifyHidden() {
+            try { if (Bridge.pauseResumeCallback) Bridge.pauseResumeCallback(JSON.stringify({ event: 'pause' })); } catch (e) {}
+        }
+        function notifyVisible() {
+            try { if (Bridge.pauseResumeCallback) Bridge.pauseResumeCallback(JSON.stringify({ event: 'resume' })); } catch (e) {}
+        }
+        try {
+            document.addEventListener('visibilitychange', function () {
+                if (document.hidden) notifyHidden(); else notifyVisible();
+            });
+            window.addEventListener('pagehide', notifyHidden);
+            window.addEventListener('freeze', notifyHidden);
+        } catch (e) {}
     })();
     </script>
 </head>

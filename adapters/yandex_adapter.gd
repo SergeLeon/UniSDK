@@ -273,13 +273,32 @@ func get_player_photo(size: String = "medium") -> String:
 		_: return str(_cached_player.get("photoMedium", ""))
 
 func get_player_data(keys: Variant = null) -> Dictionary:
-	var res: Dictionary
-	if is_web():
-		var keys_json: String = JSON.stringify(keys) if keys != null else ""
-		res = await call_js_async("getPlayerData", [keys_json])
-	else:
-		res = _core.mock_bridge.get_player_data(keys)
-	return res.get("data", {}) if res.get("success", false) else {}
+	var res: Dictionary = await get_player_data_ex(keys)
+	return res.get("data", {})
+
+
+## Чтение сохранения со статусом: ok=false -> облако Яндекс.Игр недоступно,
+## а не «сохранения нет». Иначе сетевой сбой принимается за пустой прогресс.
+func get_player_data_ex(keys: Variant = null) -> Dictionary:
+	var result: Dictionary = { "ok": false, "data": {}, "from_cache": false }
+
+	if not is_web():
+		# Мок-платформа: сети нет, статус берём из ответа моста.
+		var mock_res: Dictionary = _core.mock_bridge.get_player_data(keys)
+		result["ok"] = bool(mock_res.get("success", false))
+		result["data"] = mock_res.get("data", {})
+		return result
+
+	var res: Dictionary = await call_js_async("getPlayerData", [JSON.stringify(keys) if keys != null else ""], 25.0)
+	if not res.get("success", false):
+		UniLogger.warn(TAG, "getPlayerData failed: %s" % res.get("error", "unknown"))
+		return result
+
+	var data = res.get("data", {})
+	result["ok"] = bool(res.get("cloud_ok", false))
+	result["from_cache"] = bool(res.get("from_cache", false))
+	result["data"] = data if data is Dictionary else {}
+	return result
 
 func get_changed_keys() -> Array:
 	if not is_web():
@@ -290,13 +309,37 @@ func get_changed_keys() -> Array:
 	return res.get("changed", [])
 
 func set_player_data(data: Dictionary, flush: bool = false) -> bool:
+	var res: Dictionary = await set_player_data_ex(data, flush)
+	return bool(res.get("ok", false))
+
+
+func set_player_data_ex(data: Dictionary, flush: bool = false) -> Dictionary:
 	var json_str: String = JSON.stringify(data)
 	if json_str.length() > MAX_SET_DATA_BYTES:
 		UniLogger.warn(TAG, "set_player_data payload exceeds 200KB limit")
-	if is_web():
-		var res: Dictionary = await call_js_async("setPlayerData", [json_str, flush])
-		return res.get("success", false)
-	return _core.mock_bridge.set_player_data(data, flush).get("success", false)
+	if not is_web():
+		var mock_res: Dictionary = _core.mock_bridge.set_player_data(data, flush)
+		var mock_ok: bool = bool(mock_res.get("success", false))
+		return { "ok": mock_ok, "success": mock_ok, "cloud_ok": true }
+	var res: Dictionary = await call_js_async("setPlayerData", [json_str, flush])
+	var success: bool = bool(res.get("success", false))
+	var cloud_ok: bool = bool(res.get("cloud_ok", false))
+	if not cloud_ok:
+		UniLogger.warn(TAG, "cloud write failed (local mirror kept)")
+	return { "ok": success and cloud_ok, "success": success, "cloud_ok": cloud_ok }
+
+
+## Синхронная отправка в мост (JS пишет localStorage до обращения к облаку).
+func set_player_data_now(data: Dictionary) -> void:
+	if not is_web():
+		_core.mock_bridge.set_player_data(data, true)
+		return
+	var bridge: JavaScriptObject = JavaScriptBridge.get_interface(get_bridge_name())
+	if bridge == null:
+		return
+	var cb: JavaScriptObject = JavaScriptBridge.create_callback(func(_args: Array) -> void: pass)
+	_core._active_js_callbacks.append(cb)
+	bridge.setPlayerData(JSON.stringify(data), true, cb)
 
 func get_player_stats(keys: Variant = null) -> Dictionary:
 	var res: Dictionary

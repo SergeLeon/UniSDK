@@ -54,6 +54,17 @@ func hide_banner() -> Dictionary:
 func get_banner_status() -> Dictionary:
 	return { "is_showing": false, "reason": "Not implemented" }
 
+## Спрашивает у платформы, поддерживает ли она нативную рекламу вообще.
+## Только для диагностики: показ рекламы НЕ должен зависеть от этого ответа,
+## потому что список методов у VK Bridge не совпадает с реальной выдачей.
+func supports_native_ads() -> Dictionary:
+	return { "supported": true, "platform": "unknown", "methods": {} }
+
+## Быстрая проверка «есть ли реклама в наличии прямо сейчас».
+## Платформы без такой проверки отвечают available = true.
+func check_ad_available(_format: String) -> Dictionary:
+	return { "success": true, "available": true }
+
 # --- Player ---
 func init_player(options: Dictionary = {}) -> Dictionary:
 	push_error("PlatformAdapter.init_player() not implemented")
@@ -64,7 +75,25 @@ func get_player_id() -> String: return ""
 func get_player_name() -> String: return ""
 func get_player_photo(_size: String = "medium") -> String: return ""
 func get_player_data(_keys: Variant = null) -> Dictionary: return {}
+
+## Чтение сохранения со статусом. ok=false означает «облако/платформа
+## недоступны», а НЕ «сохранения нет». Без этого различия сбой сети
+## принимается за отсутствие прогресса и затирает облако (п. 2.3.8).
+func get_player_data_ex(keys: Variant = null) -> Dictionary:
+	return { "ok": false, "data": await get_player_data(keys), "from_cache": false }
+
 func set_player_data(_data: Dictionary, _flush: bool = false) -> bool: return false
+
+## Запись сохранения со статусом. ok=false означает, что данные остались
+## только в локальном зеркале и запись в облако нужно повторить.
+## success — «сырой» успех записи в мост (обратная совместимость с set_player_data).
+func set_player_data_ex(data: Dictionary, flush: bool = false) -> Dictionary:
+	var ok: bool = await set_player_data(data, flush)
+	return { "ok": ok, "success": ok, "cloud_ok": false }
+
+## Синхронный (без await) сброс в JS-мост. Нужен в момент сворачивания
+## приложения, когда таймеры Godot вот-вот остановятся.
+func set_player_data_now(_data: Dictionary) -> void: pass
 func get_player_stats(_keys: Variant = null) -> Dictionary: return {}
 func set_player_stats(_stats: Dictionary) -> bool: return false
 func increment_player_stats(_increments: Dictionary) -> Dictionary: return {}
