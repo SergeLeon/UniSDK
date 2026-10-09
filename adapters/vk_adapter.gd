@@ -2,8 +2,19 @@
 class_name VKAdapter
 extends PlatformAdapter
 
-const AD_TIMEOUT_MS: int = 75000
-const INTERSTITIAL_HARD_TIMEOUT_MS: int = 15000
+## Сколько ждать дополнительное событие после первого ответа моста.
+## Первый ответ приходит из call_js_async и означает, что ролик уже закрыт:
+## сюда мы попадаем, только если пришло 'rewarded' и мы ждём парный 'close'.
+## Оба события мост отдаёт одним пакетом, поэтому ждать долго нечего —
+## раньше здесь стояло 75 с, и это был второй (лишний) источник долгого
+## ожидания, перекрывавший лимиты внешних слоёв.
+## Ждать парное событие дольше пары секунд бессмысленно: мост отправляет
+## 'rewarded' и 'close' одним пакетом, и если второго нет — его уже не будет.
+const AD_EVENT_TAIL_TIMEOUT_S: float = 2.0
+const INTERSTITIAL_EVENT_TAIL_TIMEOUT_S: float = 2.0
+## Сколько ждать 'close' уже ПОСЛЕ подтверждённой награды. Награда важнее
+## закрытия, поэтому здесь ждём совсем немного.
+const REWARD_CLOSE_TAIL_TIMEOUT_S: float = 1.5
 const TAG := "vk"
 
 var _cached_environment: Dictionary = {}
@@ -86,12 +97,16 @@ func _web_show_interstitial() -> Dictionary:
 
 	var close_received: bool = false
 	var error_received: bool = false
-	var timed_out: bool = false
 	var start: int = Time.get_ticks_msec()
 
 	while not close_received and not error_received:
-		var next: Dictionary = await _core._wait_for_next_ad_event(5.0)
+		var remaining: float = maxf(0.05, (start + int(INTERSTITIAL_EVENT_TAIL_TIMEOUT_S * 1000.0) \
+			- Time.get_ticks_msec()) / 1000.0)
+		var next: Dictionary = await _core._wait_for_next_ad_event(remaining)
 		var ev: String = str(next.get("event", "")).to_lower()
+		# «событий больше нет» — это не ошибка показа, выходим и решаем по факту.
+		if _is_event_queue_empty(next):
+			break
 		match ev:
 			"close", "onclose":
 				result.was_shown = next.get("wasShown", false)
@@ -99,14 +114,12 @@ func _web_show_interstitial() -> Dictionary:
 			"error", "onerror":
 				result.error = str(next.get("error", "Ad error"))
 				error_received = true
-			"timeout":
-				break
-		if (Time.get_ticks_msec() - start) > INTERSTITIAL_HARD_TIMEOUT_MS:
-			result.error = "Hard timeout waiting for interstitial"
-			timed_out = true
+		if (Time.get_ticks_msec() - start) > int(INTERSTITIAL_EVENT_TAIL_TIMEOUT_S * 1000.0):
 			break
 
-	result.success = close_received and not error_received and not timed_out
+	result.success = close_received and not error_received
+	if not close_received and not error_received:
+		result.error = "No close event from interstitial"
 	_core._clear_ad_event_queue()
 	return result
 
@@ -139,24 +152,54 @@ func _web_show_rewarded() -> Dictionary:
 		"close", "onclose": result.was_shown = cb_data.get("wasShown", true); close_received = true
 		"error", "onerror": result.error = str(cb_data.get("error", "Ad error")); error_received = true
 
+	# Награду платформа уже подтвердила — её нельзя терять из-за того, что
+	# следом не пришло событие закрытия. Поэтому после 'rewarded' ждём 'close'
+	# недолго, а после него в любом случае отдаём награду наверх.
+	#
+	# ВАЖНО: «событий больше нет» приходит от _wait_for_next_ad_event как
+	# { event: "error", error: "Timeout waiting for ad event" }. Это НЕ ошибка
+	# показа, а просто конец событий, поэтому такой ответ не должен стирать уже
+	# полученную награду (раньше именно это и происходило).
 	var start: int = Time.get_ticks_msec()
+	var deadline_ms: int = start + int(AD_EVENT_TAIL_TIMEOUT_S * 1000.0)
 	while not close_received and not error_received:
-		var next: Dictionary = await _core._wait_for_next_ad_event(60.0)
+		var remaining: float = maxf(0.05, (deadline_ms - Time.get_ticks_msec()) / 1000.0)
+		var next: Dictionary = await _core._wait_for_next_ad_event(remaining)
 		var ev: String = str(next.get("event", "")).to_lower()
+		if ev == "timeout" or _is_event_queue_empty(next):
+			break
 		match ev:
-			"rewarded", "reward", "onrewarded": got_reward = true
+			"rewarded", "reward", "onrewarded":
+				got_reward = true
+				# События показа приходят одним пакетом, так что после награды
+				# закрытие ждём лишь короткое время, чтобы не тянуть игру.
+				deadline_ms = Time.get_ticks_msec() + int(REWARD_CLOSE_TAIL_TIMEOUT_S * 1000.0)
 			"close", "onclose": result.was_shown = next.get("wasShown", true); close_received = true
 			"error", "onerror": result.error = str(next.get("error", "Ad error")); error_received = true
-			"timeout": break
-		if (Time.get_ticks_msec() - start) > AD_TIMEOUT_MS:
-			result.error = "Timeout"
-			timed_out = true
+		if Time.get_ticks_msec() >= deadline_ms:
 			break
 
-	result.success = close_received and not timed_out
+	# success — показ состоялся. Награда считается выданной, если платформа
+	# подтвердила её событием, даже когда следом не пришёл 'close'.
+	result.success = (close_received or got_reward) and not error_received
 	result.rewarded = got_reward
+	if got_reward and not close_received:
+		UniLogger.warn(TAG, "rewarded: награда подтверждена, но закрытие не пришло — отдаём награду")
+	elif not got_reward and not close_received:
+		result.error = "Timeout waiting for rewarded ad"
 	_core._clear_ad_event_queue()
 	return result
+
+## «Событий больше нет» — это не ошибка показа. _wait_for_next_ad_event
+## сообщает об этом как об ошибке с текстом про timeout, поэтому отличаем
+## такой ответ от настоящей ошибки рекламы.
+func _is_event_queue_empty(event_data: Dictionary) -> bool:
+	var event_name: String = str(event_data.get("event", "")).to_lower()
+	if event_name != "error" and event_name != "onerror":
+		return false
+	var seen: String = str(event_data.get("error", ""))
+	return seen.is_empty() or UniAds.is_timeout_error(seen)
+
 
 func _mock_show_rewarded() -> Dictionary:
 	var result: Dictionary = { "success": false, "rewarded": false, "was_shown": false, "error": "" }

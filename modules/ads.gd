@@ -61,8 +61,17 @@ const TIMEOUT_PATTERNS: PackedStringArray = [
 ##   uni_sdk/ads/interstitial_timeout
 ##   uni_sdk/ads/rewarded_timeout
 ##   uni_sdk/ads/check_timeout
-const DEFAULT_INTERSTITIAL_TIMEOUT: float = 12.0
-const DEFAULT_REWARDED_TIMEOUT: float = 25.0
+##
+## ВАЖНО про порядок лимитов. Показ устроен в три слоя, и лимит внешнего слоя
+## обязан быть БОЛЬШЕ внутреннего, иначе игра сдаётся раньше, чем VK закроет
+## ролик, и награда теряется:
+##   JS (_safeSend внутри showNativeAds) — 20 с (interstitial) / 45 с (reward)
+##   GDScript-адаптер (call_js_async)     — 30 с / 60 с
+##   этот модуль                         — 30 с / 55 с
+## Ролик длиннее внутреннего лимита JS обрывается на стороне моста и награду
+## не приносит, поэтому внутренние лимиты подняты с запасом.
+const DEFAULT_INTERSTITIAL_TIMEOUT: float = 30.0
+const DEFAULT_REWARDED_TIMEOUT: float = 55.0
 ## Сколько ждём ответ на быструю проверку «есть ли реклама». VKWebAppCheckNativeAds
 ## отвечает быстро именно тогда, когда рекламы нет, — поэтому по этой проверке
 ## можно отсечь пустой показ, не заставляя игрока ждать весь лимит.
@@ -208,12 +217,11 @@ static func is_timeout_error(error: String) -> bool:
 
 
 ## Ждёт результат асинхронного вызова не дольше timeout_sec.
-## Нужен как гарантия: адаптер может ждать ответа VK десятки секунд
-## (у VK собственные таймауты на 15–75 с), и всё это время игра стоит.
-## Если время вышло, возвращаем управление игре и помечаем попытку неудачной.
-## Поздний ответ VK уже никого не ждёт и на игру не влияет.
-## Вызов оборачивается в лямбду, чтобы получить объект состояния корутины,
-## а не запускать её до конца: await на таком объекте даёт её результат.
+## Нужен как гарантия: показ идёт через JS-мост и может не ответить вовсе,
+## и всё это время игра стоит. Если время вышло, возвращаем управление игре
+## и помечаем попытку неудачной. Поздний ответ VK уже никого не ждёт и на игру
+## не влияет. Вызов оборачивается в лямбду, чтобы получить объект состояния
+## корутины, а не запускать её до конца: await на таком объекте даёт результат.
 func _await_with_timeout(adapter_call: Callable, timeout_sec: float) -> Dictionary:
 	var pending: Array = [null]
 	var completed: Array = [false]
@@ -223,15 +231,29 @@ func _await_with_timeout(adapter_call: Callable, timeout_sec: float) -> Dictiona
 			return
 		completed[0] = true
 		pending[0] = value
+	var started: float = Time.get_ticks_msec() / 1000.0
 	runner.call()
-	if await _wait_until(completed, timeout_sec):
+	var finished_in_time: bool = await _wait_until(completed, timeout_sec)
+	var elapsed: float = Time.get_ticks_msec() / 1000.0 - started
+	# Длительность полезна для отладки: по ней видно, сколько реально шёл ролик
+	# и не упираемся ли мы в лимит ожидания.
+	UniLogger.info("ads", "ожидание показа: %.1f с (лимит %.0f с)%s" % [
+		elapsed, timeout_sec, "" if finished_in_time else " — ЛИМИТ ИСТЁК"])
+	if finished_in_time:
 		var result: Variant = pending[0]
 		if result is Dictionary:
-			return result
+			var dict: Dictionary = result
+			dict["duration"] = elapsed
+			return dict
 		return { "success": false, "was_shown": false, "rewarded": false,
-			"error": "Empty ad response" }
+			"error": "Empty ad response", "duration": elapsed }
+	# Лимит истёк. Для rewarded это особенно важно: если ролик всё-таки
+	# доиграл позже, награда уже не придёт — помечаем это в телеметрии,
+	# чтобы такие случаи были видны, а не растворялись в общем счётчике.
+	var timeout_error := "Timeout waiting for ad display (%ds)" % int(timeout_sec)
+	UniLogger.warn("ads", "%s" % timeout_error)
 	return { "success": false, "was_shown": false, "rewarded": false,
-		"error": "Timeout waiting for ad display (%ds)" % int(timeout_sec) }
+		"error": timeout_error, "duration": elapsed }
 
 
 ## Ждёт смены флага. true — флаг выставлен, false — истёк лимит времени.
@@ -378,6 +400,12 @@ func show_rewarded() -> Dictionary:
 	var was_shown: bool = bool(result.get("was_shown", false))
 	var rewarded: bool = bool(result.get("rewarded", false))
 	var error_text: String = str(result.get("error", ""))
+
+	# Ролик доиграл, а награду платформа не подтвердила — самый неприятный
+	# случай для игрока, поэтому логируем отдельно и с длительностью.
+	if not rewarded and (was_shown or success):
+		UniLogger.warn("ads", "rewarded: показ был (%.1f с), но награда не подтверждена (%s)" % [
+			float(result.get("duration", 0.0)), error_text if not error_text.is_empty() else "нет события rewarded"])
 
 	if rewarded:
 		rewarded_rewarded.emit()
