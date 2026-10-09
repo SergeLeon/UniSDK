@@ -185,8 +185,8 @@ addons/uni_sdk/
 | `uni_sdk/general/debug_log` | `bool` | `false` | Зарегистрирован в настройках, но `UniLogger` его пока не читает: уровень зависит от типа сборки (DEBUG в debug, WARN в release) |
 | `uni_sdk/ads/auto_mute_audio` | `bool` | `true` | Глушить master-шину при рекламе |
 | `uni_sdk/ads/interstitial_cooldown` | `float` | `60.0` | Кулдаун между межстраничными (сек) |
-| `uni_sdk/ads/interstitial_timeout` | `float` | `12.0` | Жёсткий лимит ожидания показа interstitial (сек) |
-| `uni_sdk/ads/rewarded_timeout` | `float` | `25.0` | Жёсткий лимит ожидания показа rewarded (сек) |
+| `uni_sdk/ads/interstitial_timeout` | `float` | `30.0` | Жёсткий лимит ожидания показа interstitial (сек) |
+| `uni_sdk/ads/rewarded_timeout` | `float` | `55.0` | Жёсткий лимит ожидания показа rewarded (сек) |
 | `uni_sdk/ads/check_timeout` | `float` | `2.5` | Лимит быстрой проверки «есть ли реклама» (сек) |
 | `uni_sdk/ads/telemetry_events` | `int` | `100` | Сколько событий рекламы держать в памяти для отчёта |
 | `uni_sdk/ads/telemetry_path` | `string` | `user://ad_telemetry.json` | Куда `dump_telemetry()` сохраняет отчёт |
@@ -517,7 +517,7 @@ if UniSDK.ads.can_show_banner():
     var status = await UniSDK.ads.get_banner_status()
 ```
 
-> ⏱ Показ ограничен по времени: 25 с для rewarded, 12 с для interstitial, 2.5 с на проверку `is_ad_available()` — управление всегда возвращается игре. При `res.rewarded == false` показ не состоялся (нет фила, таймаут или отказ платформы) — сообщите об этом игроку.
+> ⏱ Показ ограничен по времени: 55 с для rewarded, 30 с для interstitial, 2.5 с на проверку `is_ad_available()` — управление всегда возвращается игре. Лимиты выставлены с запасом к таймаутам JS-моста (45 / 20 с): внешний слой обязан ждать дольше внутреннего, иначе игра сдаётся раньше, чем VK закроет ролик, и награда теряется. При `res.rewarded == false` показ не состоялся (нет фила, таймаут или отказ платформы) — сообщите об этом игроку.
 
 ### Профиль игрока
 
